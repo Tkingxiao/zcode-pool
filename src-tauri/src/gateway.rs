@@ -245,11 +245,8 @@ struct Inner {
     /// 在 `candidates` 里直接按实时额度筛掉了，那张表已删。
     blocked: HashMap<String, u64>,
 
-    /// 上游通道熔断到什么时候（0 = 没熔）。见 `EDGE_COOLDOWN_MS`
-    edge_until: u64,
-
-    /// 熔断期内是否已经记过日志 —— 被挡下的请求不再逐条刷日志
-    edge_warned: bool,
+    /// 上游通道熔断状态（与号无关，整条通道共用一个）
+    edge: Edge,
 }
 
 #[derive(Clone, Default)]
@@ -257,6 +254,48 @@ pub struct Gateway {
     inner: Arc<Mutex<Inner>>,
 
     app: Arc<std::sync::OnceLock<tauri::AppHandle>>,
+}
+
+/// 通道级熔断的状态机。刻意不依赖 `Gateway`/tauri 类型 —— 只要测试里出现
+/// `Gateway`，`OnceLock<AppHandle>` 的 drop glue 就会把整套 tauri/Win32 入口拉进
+/// 测试二进制，而它没带应用清单，进程启动即 STATUS_ENTRYPOINT_NOT_FOUND（实测踩过）。
+#[derive(Default)]
+struct Edge {
+    /// 解冻时刻（0 = 没熔）
+    until: u64,
+    /// 熔断期内是否已经记过日志
+    warned: bool,
+}
+
+impl Edge {
+    fn trip(&mut self, now: u64, ms: u64) {
+        self.until = now + ms;
+        self.warned = false;
+    }
+
+    /// 手动解除，返回解除时还剩多少毫秒
+    fn reset(&mut self, now: u64) -> u64 {
+        let left = self.until.saturating_sub(now);
+        self.until = 0;
+        self.warned = false;
+        left
+    }
+
+    fn left(&self, now: u64) -> u64 {
+        self.until.saturating_sub(now)
+    }
+
+    /// 熔断中就给出 `(还剩多久, 是不是这一轮第一次)`；第一次那次为 true ——
+    /// 日志只在那一次打，否则客户端每秒重试就是每秒一行（旧版实测 3 分钟 2870 行）。
+    fn waiting(&mut self, now: u64) -> Option<(u64, bool)> {
+        let left = self.until.saturating_sub(now);
+        if left == 0 {
+            return None;
+        }
+        let first = !self.warned;
+        self.warned = true;
+        Some((left, first))
+    }
 }
 
 struct Candidate {
@@ -421,7 +460,7 @@ impl Gateway {
             "routedQuota": quota_rows_for(&g, route_id.as_deref()),
             "clientQuota": quota_rows_for(&g, client_id.as_deref()),
             "blocked": g.blocked.values().filter(|t| **t > now_ms()).count(),
-            "edgeLeft": g.edge_until.saturating_sub(now_ms()),
+            "edgeLeft": g.edge.left(now_ms()),
             "policy": g.policy,
             "pinned": g.pinned,
             "sticky": g.sticky,
@@ -521,18 +560,12 @@ impl Gateway {
 
     /// 熔断整条上游通道 `ms`：期间 `handle_external` 直接回 503，一个请求都不往上游发。
     fn edge_trip(&self, ms: u64) {
-        let mut g = self.inner.lock().unwrap();
-        g.edge_until = now_ms() + ms;
-        g.edge_warned = false;
+        self.inner.lock().unwrap().edge.trip(now_ms(), ms);
     }
 
     /// 手动解除通道熔断（换了出口/网络之后不想干等 TTL）。返回解除时还剩多少毫秒。
     fn edge_reset(&self) -> u64 {
-        let mut g = self.inner.lock().unwrap();
-        let left = g.edge_until.saturating_sub(now_ms());
-        g.edge_until = 0;
-        g.edge_warned = false;
-        left
+        self.inner.lock().unwrap().edge.reset(now_ms())
     }
 
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
@@ -1876,14 +1909,8 @@ fn handle_external(
     }
 
     // 熔断期：一个请求都不往上游发。撞得越勤，边缘拦得越久（实测 405 三分钟内累计 2870 发）。
-    let (edge_left, edge_first) = {
-        let mut g = gw.inner.lock().unwrap();
-        let left = g.edge_until.saturating_sub(now_ms());
-        let first = left > 0 && !g.edge_warned;
-        g.edge_warned |= first;
-        (left, first)
-    };
-    if edge_left > 0 {
+    let waiting = { gw.inner.lock().unwrap().edge.waiting(now_ms()) };
+    if let Some((edge_left, edge_first)) = waiting {
         let secs = edge_left.div_euclid(1000).max(1);
         if edge_first {
             crate::flowlog::log("relay", "edge-wait", &format!("上游通道在熔断中，还剩 {secs}s —— 期间进来的请求直接挡回，不出站"));
@@ -3047,5 +3074,42 @@ mod tests {
         for code in SWITCH_STATUS {
             assert!(!PATH_STATUS.contains(&code), "{code}");
         }
+    }
+
+    #[test]
+    fn breaker_holds_until_manual_release() {
+        let mut e = Edge::default();
+        assert_eq!(e.waiting(1_000), None);
+
+        e.trip(1_000, 60_000);
+        assert_eq!(e.left(1_000), 60_000);
+        // 第一次挡下记一条日志，之后同一轮的挡下不得再刷
+        assert_eq!(e.waiting(2_000), Some((59_000, true)));
+        assert_eq!(e.waiting(3_000), Some((58_000, false)));
+
+        assert_eq!(e.reset(10_000), 51_000, "解除应当报告原本还剩多久");
+        assert_eq!(e.waiting(11_000), None);
+        assert_eq!(e.reset(12_000), 0, "重复解除不该留下脏状态");
+    }
+
+    #[test]
+    fn tripping_again_extends_and_rearms_the_one_shot_log() {
+        let mut e = Edge::default();
+        e.trip(1_000, 60_000);
+        assert_eq!(e.waiting(2_000), Some((59_000, true)));
+        // 熔断没结束又撞一发别的（如 5xx 的短熔断）：以新窗口为准，并允许再记一条
+        e.trip(3_000, 15_000);
+        assert_eq!(e.left(3_000), 15_000);
+        assert_eq!(e.waiting(4_000), Some((14_000, true)));
+        assert_eq!(e.waiting(5_000), Some((13_000, false)));
+    }
+
+    #[test]
+    fn an_expired_window_stops_blocking_without_clearing_the_armed_flag() {
+        let mut e = Edge::default();
+        e.trip(0, 100);
+        assert_eq!(e.waiting(50), Some((50, true)));
+        assert_eq!(e.waiting(200), None, "过期就不再挡请求");
+        assert_eq!(e.left(200), 0);
     }
 }
