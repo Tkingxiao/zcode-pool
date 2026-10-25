@@ -1480,6 +1480,27 @@ fn backoff_ms(attempt: usize) -> u64 {
     ((capped as i64) * (100 + jitter) / 100).max(50) as u64
 }
 
+/// 号级失败的冷却时长。**生产换号和对话测试共用**这一处判断 —— 两边各写一遍迟早会飘，
+/// 而测试里那句「真跑会被冷却多久」报错了就等于在骗人。
+fn account_cooldown(status: u16) -> u64 {
+    if status == 429 { RATE_TTL_MS } else { AUTH_COOLDOWN_MS }
+}
+
+/// 给「对话测试」用的完整定性：在 `upstream_verdict` 之上再把**号级**状态码讲清楚。
+///
+/// 只借 `upstream_verdict` 会出错：它只服务「与号无关」那一支，401 不在 `PATH_STATUS`、
+/// 不是 5xx、应答也不是 HTML，于是掉进最后一档 `未预期 4xx` 并且冷却报 0 —— 而真实转发
+/// 里 401 是号级失败、要冷却一分钟、还得换号。所以这里单独点名这几个码。
+fn verdict_for_probe(status: u16, snip: &str) -> (&'static str, u64) {
+    match status {
+        401 => ("凭证失效 —— 这个号要重新登录", account_cooldown(status)),
+        402 => ("额度/套餐不足（上游用 402 拒绝）—— 等重置或换号", account_cooldown(status)),
+        403 => ("有身份但没权限 —— 这个号用不了这条通道", account_cooldown(status)),
+        429 => ("限流", account_cooldown(status)),
+        _ => upstream_verdict(status, snip),
+    }
+}
+
 /// 非 2xx 且**不是号的问题**时，这条应答怎么定性：`(给人看的标签, 熔断多久)`，0 = 不熔断。
 ///
 /// 优先级：先查明确列出的通道级状态码（路由被关、方法不许、501/505 这种"这条路本身不通"），
@@ -2306,7 +2327,7 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
             let mut buf = String::new();
             let _ = r.into_reader().take(600).read_to_string(&mut buf);
             let snip = crate::quota::body_snippet(&buf);
-            let (kind, cool) = upstream_verdict(code, &snip);
+            let (kind, cool) = verdict_for_probe(code, &snip);
             json!({
                 "ok": false, "status": code, "ms": ms, "kind": kind, "snippet": snip,
                 "would_cooldown_s": cool / 1000
@@ -2539,7 +2560,7 @@ fn handle_external(
             if SWITCH_STATUS.contains(&status) {
                 // 四类一律冷却。以前只有 429 冷却，于是 401/402/403 的号既不冻结也不重取
                 // 额度 —— 下一个请求仍从它开始，每一发都白烧一次往返。
-                let cool = if status == 429 { RATE_TTL_MS } else { AUTH_COOLDOWN_MS };
+                let cool = account_cooldown(status);
                 gw.mark_blocked(&c.id, cool);
                 // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL
                 gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
@@ -3534,6 +3555,33 @@ mod tests {
         assert_eq!(upstream_verdict(302, JSON).1, 0);
         assert_eq!(upstream_verdict(200, JSON).1, 0); // 2xx 走不到这里，兜底也要给 0
         assert_eq!(upstream_verdict(100, "").1, 0);
+    }
+
+    #[test]
+    fn probe_verdict_names_the_account_level_codes() {
+        // 这几个码在真实转发里是「号的问题」。测试只借 upstream_verdict 的话，401 会被
+        // 归成「未预期 4xx」并且冷却报 0 —— 那就是在骗人。
+        for code in [401u16, 402, 403] {
+            let (kind, cool) = verdict_for_probe(code, r#"{"message":"denied"}"#);
+            assert_eq!(cool, AUTH_COOLDOWN_MS, "{code} 必须和生产同一档冷却");
+            assert_ne!(kind, "未预期 4xx", "{code}");
+            assert!(kind.contains("号") || kind.contains("登录") || kind.contains("重置"), "{code} 要说清下一步");
+        }
+        assert_eq!(verdict_for_probe(429, ""), ("限流", RATE_TTL_MS));
+    }
+
+    #[test]
+    fn probe_verdict_delegates_the_rest_to_upstream_verdict() {
+        for (code, snip) in [(405u16, "<!doctype html>"), (404, "{}"), (503, "{}"), (400, "{}"), (302, "{}")] {
+            assert_eq!(verdict_for_probe(code, snip), upstream_verdict(code, snip), "{code}");
+        }
+    }
+
+    #[test]
+    fn production_and_probe_read_one_cooldown_rule() {
+        assert_eq!(account_cooldown(429), RATE_TTL_MS);
+        assert_eq!(account_cooldown(401), AUTH_COOLDOWN_MS);
+        assert!(AUTH_COOLDOWN_MS < RATE_TTL_MS, "凭证类失败不该把只有一个号的池子冻满五分钟");
     }
 
     #[test]
