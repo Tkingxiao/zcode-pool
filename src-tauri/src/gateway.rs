@@ -1533,25 +1533,22 @@ fn pick_token_index(tokens: &[String], hint: Option<&str>) -> usize {
     }
 }
 
+/// 凭证被上游接受了、但这一发没出话 —— 按状态码给个准确说法。
+/// 关键是别把它写成"凭证失效"：那会让人去重新登录，而真正的原因往往是并发超限或上游抖动。
+fn probe_gap_label(status: u16) -> String {
+    match status {
+        200 => "上游认这个凭证，但应答里没有模型内容".to_string(),
+        402 => "额度/套餐不足（402）—— 等重置或换号".to_string(),
+        429 => "并发或限流（429）—— 这个号此刻被占满（例：正在官方客户端里用）".to_string(),
+        s if s >= 500 => format!("上游故障（HTTP {s}）—— 与凭证无关"),
+        s => format!("上游认这个凭证，但回了 HTTP {s}"),
+    }
+}
+
 /// 号级失败的冷却时长。**生产换号和对话测试共用**这一处判断 —— 两边各写一遍迟早会飘，
 /// 而测试里那句「真跑会被冷却多久」报错了就等于在骗人。
 fn account_cooldown(status: u16) -> u64 {
     if status == 429 { RATE_TTL_MS } else { AUTH_COOLDOWN_MS }
-}
-
-/// 给「对话测试」用的完整定性：在 `upstream_verdict` 之上再把**号级**状态码讲清楚。
-///
-/// 只借 `upstream_verdict` 会出错：它只服务「与号无关」那一支，401 不在 `PATH_STATUS`、
-/// 不是 5xx、应答也不是 HTML，于是掉进最后一档 `未预期 4xx` 并且冷却报 0 —— 而真实转发
-/// 里 401 是号级失败、要冷却一分钟、还得换号。所以这里单独点名这几个码。
-fn verdict_for_probe(status: u16, snip: &str) -> (&'static str, u64) {
-    match status {
-        401 => ("凭证失效 —— 这个号要重新登录", account_cooldown(status)),
-        402 => ("额度/套餐不足（上游用 402 拒绝）—— 等重置或换号", account_cooldown(status)),
-        403 => ("有身份但没权限 —— 这个号用不了这条通道", account_cooldown(status)),
-        429 => ("限流", account_cooldown(status)),
-        _ => upstream_verdict(status, snip),
-    }
 }
 
 /// 非 2xx 且**不是号的问题**时，这条应答怎么定性：`(给人看的标签, 熔断多久)`，0 = 不熔断。
@@ -2247,6 +2244,52 @@ fn external_body(
 
 /// 选号：按 policy 排好、再把本会话上次用的号挪到队首；该模型全库无额度时回退到另一个模型。
 /// 刷完额度要能原样重跑一遍，所以把这段从 `handle_external` 里摘出来。
+/// 上游错误体里的业务码 → 人话。只点名线上真见过的几个。
+fn upstream_reason(code: i64) -> Option<&'static str> {
+    match code {
+        3009 => Some("并发超限 —— 同一个号的模型并发被占满（例：这个号正在官方客户端里用）"),
+        3012 => Some("提示词被判异常 —— 身份段重复或被改动"),
+        _ => None,
+    }
+}
+
+/// 从应答里取业务码（`{"code":3009}`）并翻成人话；取不到就回 None。
+fn upstream_why(snip: &str) -> Option<String> {
+    let code = peek_code(snip.as_bytes());
+    match code.parse::<i64>() {
+        Ok(c) if c != 0 => Some(match upstream_reason(c) {
+            Some(t) => format!("{t}（code {c}）"),
+            None => format!("上游业务码 {c}"),
+        }),
+        _ => None,
+    }
+}
+
+/// 200 却没有正文时，进一步说清应答是什么形状 —— 两者的处置不一样。
+/// 必须喂**完整** body：`body_snippet` 截到 120 字会把 JSON 截断，解析必然失败。
+fn reply_shape(s: &str) -> Option<&'static str> {
+    let v = serde_json::from_str::<Value>(s).ok()?;
+    let arr = v.get("content").and_then(Value::as_array)?;
+    // 有正文就别报形状问题（正常路径走不到这儿，但函数得自己站得住）
+    if arr
+        .iter()
+        .any(|b| b.get("text").and_then(Value::as_str).is_some_and(|t| !t.trim().is_empty()))
+    {
+        return None;
+    }
+    if arr.iter().any(|b| b.get("thinking").is_some()) {
+        return Some("只有思考块、没有正文 —— max_tokens 太小或模型正在思考");
+    }
+    Some("有 content 数组但里面没有正文")
+}
+
+/// 这份凭证是不是**认证失败**（该换下一份试试）。
+/// 只有 401/403 才是「凭证不对」；200/402/429/5xx 都说明上游认了这个凭证，
+/// 只是这一刻出不了话 —— 把它们混为一谈就会把对的凭证判成坏的。
+fn is_auth_rejected(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
 /// 从应答里捞出模型说的话。优先非流式 JSON 的 `content[].text`；
 /// 拿回的是 SSE 或半截 JSON 就退而求其次扫第一段 `"text":"…"`。
 /// 返回 `None` 表示「没收到回复」—— 这正是对话测试要告诉用户的事。
@@ -2346,7 +2389,9 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
     let sess = account_session(id, &day_seed());
     let plain = json!({
         "model": model,
-        "max_tokens": 16,
+        // 64 已经够短（一发 hi），但不能再小了：这类模型会先吐 thinking 块，
+        // 16 个 token 全花在思考上就会「HTTP 200 却没有 text 块」，看着像没回复。
+        "max_tokens": 64,
         "messages": [{ "role": "user", "content": "hi" }],
     })
     .to_string();
@@ -2368,69 +2413,86 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
     let mut tried: Vec<Value> = vec![];
     let mut out: Value = json!({ "ok": false, "error": "没试出结果" });
 
+    let remember = |sha: &str| -> bool {
+        // 只存 sha256 前 16 位，账号文件里不落明文凭证
+        let mut saved = acc.clone();
+        saved.plan_token = Some(sha.to_string());
+        store::save_account(paths, &saved).is_ok()
+    };
+    let cred = |i: usize, sha: &str, persisted: bool, was: bool| json!({
+        "index": i + 1, "total": toks.len(), "sha8": sha[..8].to_string(),
+        "persisted": persisted, "wasRemembered": was,
+    });
+    let mut settled = false;
+
     for i in order {
         let sha = token_sha16(&toks[i]);
         let t0 = now_ms();
         let sent = set_relay_headers(agent.request("POST", &target), &toks[i]).send_bytes(&out_body);
         let ms = now_ms().saturating_sub(t0);
-        out = match sent {
+        let (status, reply, snip, net, shape) = match sent {
             Ok(r) => {
-                let status = r.status();
+                let st = r.status();
                 let mut buf = String::new();
                 let _ = r.into_reader().take(8192).read_to_string(&mut buf);
-                match extract_reply_text(&buf) {
-                    Some(t) => json!({ "ok": true, "status": status, "ms": ms, "reply": t }),
-                    None => json!({
-                        "ok": false, "status": status, "ms": ms,
-                        "kind": "HTTP 正常但应答里没有模型内容",
-                        "snippet": crate::quota::body_snippet(&buf)
-                    }),
-                }
+                let reply = extract_reply_text(&buf);
+                let shape = if reply.is_none() { reply_shape(&buf) } else { None };
+                (Some(st), reply, crate::quota::body_snippet(&buf), None, shape)
             }
             Err(ureq::Error::Status(code, r)) => {
                 let mut buf = String::new();
                 let _ = r.into_reader().take(600).read_to_string(&mut buf);
-                let snip = crate::quota::body_snippet(&buf);
-                let (kind, cool) = verdict_for_probe(code, &snip);
-                json!({
-                    "ok": false, "status": code, "ms": ms, "kind": kind, "snippet": snip,
-                    "would_cooldown_s": cool / 1000
-                })
+                (Some(code), None, crate::quota::body_snippet(&buf), None, None)
             }
-            Err(e) => json!({ "ok": false, "ms": ms, "kind": "网络错误", "error": e.to_string() }),
+            Err(e) => (None, None, String::new(), Some(e.to_string()), None),
         };
+        let why = if snip.is_empty() { None } else { upstream_why(&snip).or_else(|| shape.map(String::from)) };
+        let verdict = match (&status, &reply) {
+            (_, Some(_)) => "出话了",
+            (Some(st), None) if !is_auth_rejected(*st) => "凭证可用，但这一刻没出话",
+            (Some(401), None) => "凭证失效 —— 这个号要重新登录",
+            (Some(403), None) => "有身份但没权限",
+            (Some(_), None) => "未预期应答",
+            (None, _) => "网络错误",
+        };
+        // 每一发都单独留下状态与应答片段。以前只保留最后一条，结果 #1 拿到的 200
+        // 被 #3 的 401 覆盖，界面就成了「无回复 HTTP 401 · 试过3份」，真因（并发超限）全丢了。
+        tried.push(json!({
+            "index": i + 1, "sha8": sha[..8].to_string(), "status": status, "ms": ms,
+            "verdict": verdict, "why": why.clone(), "snippet": snip.clone(),
+        }));
 
-        if out.get("ok").and_then(Value::as_bool) == Some(true) {
-            // 记住这一个：账号文件里只存 sha256 前 16 位，不存明文凭证
-            let mut saved = acc.clone();
-            saved.plan_token = Some(sha.clone());
-            let persisted = store::save_account(paths, &saved).is_ok();
-            if let Some(o) = out.as_object_mut() {
-                o.insert("credential".to_string(), json!({
-                    "index": i + 1,
-                    "total": toks.len(),
-                    "sha8": sha[..8].to_string(),
-                    "persisted": persisted,
-                    "wasRemembered": acc.plan_token.as_deref() == Some(sha.as_str()),
-                }));
-            }
-            tried.push(json!({ "index": i + 1, "sha8": sha[..8].to_string(), "ok": true }));
+        if let Some(t) = reply {
+            let persisted = remember(&sha);
+            out = json!({ "ok": true, "authOk": true, "status": status, "ms": ms, "reply": t,
+                          "credential": cred(i, &sha, persisted, acc.plan_token.as_deref() == Some(sha.as_str())) });
+            settled = true;
             break;
         }
-        tried.push(json!({
-            "index": i + 1,
-            "sha8": sha[..8].to_string(),
-            "status": out.get("status").cloned().unwrap_or(Value::Null),
-            "kind": out.get("kind").cloned().unwrap_or_else(|| out.get("error").cloned().unwrap_or(Value::Null)),
-        }));
+        // 上游只要认了这个凭证（不是 401/403），就到此为止：再往下试多半会撞上那条端点根本不认的
+        // provider apiKey，反而把「凭证其实是对的」盖成 401。出不了话是另一回事，照实报。
+        if let Some(st) = status {
+            if !is_auth_rejected(st) {
+                let persisted = remember(&sha);
+                out = json!({
+                    "ok": false, "authOk": true, "status": st, "ms": ms,
+                    "kind": why.or_else(|| shape.map(String::from)).unwrap_or_else(|| probe_gap_label(st)),
+                    "snippet": snip, "credential": cred(i, &sha, persisted, false),
+                });
+                settled = true;
+                break;
+            }
+        }
+        out = json!({ "ok": false, "authOk": false, "status": status, "ms": ms,
+                      "kind": verdict, "error": net, "snippet": snip });
     }
 
-    // 全都试不通：把提示清掉，别把一次失败的猜测固化成长期行为
-    if out.get("ok").and_then(Value::as_bool) != Some(true) && acc.plan_token.is_some() {
+    // 一份凭证都没被接受过：清掉提示，别把一次失败的猜测固化成长期行为
+    if !settled && acc.plan_token.is_some() {
         let mut cleared = acc.clone();
         cleared.plan_token = None;
         let _ = store::save_account(paths, &cleared);
-        tried.push(json!({ "note": "已清掉记住的凭证，回到默认顺序" }));
+        tried.push(json!({ "note": "所有凭证都被拒，已清掉记住的那一份" }));
     }
     if let Some(o) = out.as_object_mut() {
         o.insert("name".to_string(), json!(name));
@@ -3663,23 +3725,45 @@ mod tests {
     }
 
     #[test]
-    fn probe_verdict_names_the_account_level_codes() {
-        // 这几个码在真实转发里是「号的问题」。测试只借 upstream_verdict 的话，401 会被
-        // 归成「未预期 4xx」并且冷却报 0 —— 那就是在骗人。
-        for code in [401u16, 402, 403] {
-            let (kind, cool) = verdict_for_probe(code, r#"{"message":"denied"}"#);
-            assert_eq!(cool, AUTH_COOLDOWN_MS, "{code} 必须和生产同一档冷却");
-            assert_ne!(kind, "未预期 4xx", "{code}");
-            assert!(kind.contains("号") || kind.contains("登录") || kind.contains("重置"), "{code} 要说清下一步");
+    fn only_401_and_403_mean_the_credential_is_wrong() {
+        // 200/402/429/5xx 都表示「上游认了这个凭证」。把它们算成凭证失效，就会接着去试
+        // 那条端点根本不认的 provider apiKey，最后报出一个假的 401 —— 线上真踩过。
+        assert!(is_auth_rejected(401));
+        assert!(is_auth_rejected(403));
+        for st in [200u16, 402, 429, 500, 503] {
+            assert!(!is_auth_rejected(st), "{st} 不该判成凭证失效");
         }
-        assert_eq!(verdict_for_probe(429, ""), ("限流", RATE_TTL_MS));
     }
 
     #[test]
-    fn probe_verdict_delegates_the_rest_to_upstream_verdict() {
-        for (code, snip) in [(405u16, "<!doctype html>"), (404, "{}"), (503, "{}"), (400, "{}"), (302, "{}")] {
-            assert_eq!(verdict_for_probe(code, snip), upstream_verdict(code, snip), "{code}");
-        }
+    fn gap_label_stops_blaming_the_credential_when_upstream_is_busy() {
+        assert!(probe_gap_label(429).contains("并发"));
+        assert!(probe_gap_label(402).contains("额度"));
+        assert!(probe_gap_label(503).contains("与凭证无关"));
+        assert!(!probe_gap_label(200).contains("重新登录"), "200 出不了话不是凭证的事");
+    }
+
+    #[test]
+    fn reply_shape_names_a_thinking_only_answer() {
+        // 200 但没正文：得说清是「只有思考块」还是「空 content」，两者处置不一样
+        assert_eq!(
+            reply_shape(r#"{"content":[{"type":"thinking","thinking":"……"}],"stop_reason":"max_tokens"}"#),
+            Some("只有思考块、没有正文 —— max_tokens 太小或模型正在思考")
+        );
+        assert_eq!(reply_shape(r#"{"content":[],"stop_reason":"refusal"}"#), Some("有 content 数组但里面没有正文"));
+        assert_eq!(reply_shape(r#"{"content":[{"type":"text","text":"hi"}]}"#), None);
+        assert_eq!(reply_shape("<!doctype html><html"), None, "被截断的片段解析不动，返回 None 就好");
+    }
+
+    #[test]
+    fn upstream_business_codes_get_named() {
+        assert_eq!(
+            upstream_why(r#"{"code":3009,"msg":"model concurrency limit exceeded"}"#).as_deref(),
+            Some("并发超限 —— 同一个号的模型并发被占满（例：这个号正在官方客户端里用）（code 3009）")
+        );
+        assert!(upstream_why(r#"{"code":3012,"msg":"unusual activity"}"#).unwrap().contains("3012"));
+        assert_eq!(upstream_why("<!doctype html><title>405</title>"), None, "HTML 没有业务码");
+        assert_eq!(upstream_why("{}"), None);
     }
 
     #[test]

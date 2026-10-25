@@ -870,26 +870,23 @@ const chatResults = {};
 function chatResultView(d, httpOk) {
   const ms = d.ms == null ? "" : (d.ms >= 1000 ? " · " + (d.ms / 1000).toFixed(1) + "s" : " · " + d.ms + "ms");
   const c = d.credential;
-  // 用的是第几份候选凭证要露出来：实测 #1 常常是 provider 的 coding-plan apiKey，
-  // 而 zcode-plan/anthropic 不认它（401），真能用的往往是 #2 的 JWT。
-  // 知道序号才知道「是换了凭证才通的」，而不是号本来就是好的。
+  // 用的是第几份候选凭证要露出来：实测 #1 曾经是 provider 的 coding-plan apiKey
+  // （那条端点根本不认它），真能用的是 JWT。知道序号才知道「是换了凭证才通的」。
   const which = c && c.total > 1 ? " · 凭证#" + c.index + "/" + c.total : "";
+  const rows = (d.attempted || []).filter((a) => a && a.index)
+    .map((a) => "#" + a.index + " " + (a.sha8 || "") + " → " + (a.verdict || a.status || "") + (a.why ? "（" + a.why + "）" : "")).join("\n");
+  const detail = (d.kind || "") + "\n" + (d.snippet || "") + (rows ? "\n—— 各份凭证 ——\n" + rows : "");
   if (d.ok) return {
     cls: "ok", text: "收到回复" + ms + which,
     title: "「" + (d.reply || "") + "」" + (c ? "\n用的是第 " + c.index + " 份候选凭证（" + c.sha8 + "…），已记住" + (c.persisted === false ? "（没能写盘）" : "") : ""),
   };
-  const tried = Array.isArray(d.attempted) ? d.attempted.filter((x) => x && x.index).length : 0;
+  // 上游认这份凭证、只是这一刻出不了话（并发超限、上游抖动）—— 不能写成凭证失效，
+  // 那会让人白跑一趟重新登录。所以是 warn，不是 bad。
+  if (d.authOk) return { cls: "warn", text: "凭证可用 · 未出话" + ms, title: detail };
+  const tried = (d.attempted || []).filter((a) => a && a.index).length;
   const many = tried > 1 ? " · 试过" + tried + "份" : "";
-  if (d.status) {
-    const cd = d.would_cooldown_s ? "真跑会被冷却 " + d.would_cooldown_s + "s" : "";
-    const rows = (d.attempted || []).filter((a) => a && a.index)
-      .map((a) => "#" + a.index + " " + (a.sha8 || "") + " → " + (a.kind || a.status || "")).join("\n");
-    return {
-      cls: "bad", text: "无回复 HTTP " + d.status + ms + many,
-      title: [d.kind, cd, d.snippet].filter(Boolean).join("\n") + (rows ? "\n—— 各份凭证 ——\n" + rows : ""),
-    };
-  }
-  return { cls: "bad", text: (httpOk ? "没拿到应答" : "网关报错") + many, title: d.error || d.detail || "未知" };
+  if (d.status) return { cls: "bad", text: "凭证被拒 HTTP " + d.status + ms + many, title: detail };
+  return { cls: "bad", text: (httpOk ? "没拿到应答" : "网关报错") + many, title: d.error || "未知" };
 }
 
 function acctChatBtns(c) {
