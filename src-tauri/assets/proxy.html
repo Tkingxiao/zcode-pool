@@ -527,6 +527,7 @@ function dataSig() {
   return [s.external, s.bind, s.port, (s.keys || []).length, s.quotaAccounts, s.lastRefresh,
     (s.quotaFailed || []).join(","), m.pool, m.mints10min, m.mints, m.active,
     s.policy, s.modelMode, s.pinned, JSON.stringify(s.modelMap || {}), (s.models || []).join(","), s.upstream,
+    s.edgeLeft > 0,
     ACC && ACC.active_account_id, ACC && ACC.zcode_running, ACC && ACC.zcode_path, ACC && ACC.store_dir,
     MBOX && MBOX.email, ((MBOX && MBOX.data && MBOX.data.messages) || []).length,
     ch, acc, mail].join("~");
@@ -852,7 +853,8 @@ function viewChan() {
             '<th class="num">成功率</th><th class="num">连败</th><th>上次探测</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>"
           : emptyState("inbox", "号池是空的 —— 先去「账号库」加号")) +
     '<div class="foot-note">探测走的是<b>额度接口</b>（免费、不用验证码），不真发模型请求 —— 那会烧号的额度。' +
-    "「解冻」清掉本地的「用尽 / 限流」标记，上游恢复了就不用干等 TTL。</div></div>";
+    "「解冻」清掉本地的「限流」标记（那是<b>号级</b>的），上游恢复了就不用干等 TTL；" +
+    "<b>通道级</b>熔断要整个上游通道都不通时才触发，在「接入」卡片里手动放行。</div></div>";
 }
 
 function patchChan() {
@@ -1040,6 +1042,9 @@ function viewSettings() {
       <div class="kv" style="margin-top:6px"><span class="k">对话页</span>
         <span class="v"><a href="/" style="color:var(--acc)">${location.origin}/</a> —— 拿来验反代通不通</span></div>
       <div class="kv" style="margin-top:6px"><span class="k">上游</span><span class="v mono">${esc(s.upstream || "—")}</span></div>
+      ${s.edgeLeft > 0 ? '<div class="kv"><span class="k">通道</span><span class="v"><span class="tag bad">熔断中 · 还剩 ' +
+        Math.ceil(s.edgeLeft / 1000) + 's</span> 期间一个模型请求都不出站（与号无关，换号也没用） ' +
+        '<button class="mini" data-unfreeze-edge>' + ICON("power", 14) + '立即放行</button></span></div>' : ""}
       <div class="kv"><span class="k">可用模型</span>
         <div class="chips">${(s.models || []).map((x) => '<span class="chip mono">' + esc(x) + "</span>").join("") || "—"}</div></div>
       <div style="color:var(--dim2);font-size:11.5px;margin-top:6px">
@@ -1264,10 +1269,8 @@ function acctStatusKeys(a) {
   const known = !!q;
   const empty = known ? (!!q.is_empty || (q.remaining != null && q.remaining <= 0)) : false;
   const frozen = !!ch.frozen;
-  const usedup = frozen && String(ch.frozen).indexOf("用尽") >= 0;
   return ["all", a.is_active ? "active" : "", known && !empty ? "has" : "",
-    known && empty ? "none" : "", frozen ? "frozen" : "", usedup ? "used" : ""]
-    .filter(Boolean).join(" ");
+    known && empty ? "none" : "", frozen ? "frozen" : ""].filter(Boolean).join(" ");
 }
 function accountCard(a) {
   const body = accountBodyHtml(a);
@@ -1549,7 +1552,7 @@ function viewAcct() {
     <div class="acct-filter">
       <span style="color:var(--dim2);font-size:11.5px">筛选</span>
       <select id="acctfilter" class="sel" style="min-width:122px">
-        ${[["all", "全部"], ["active", "当前登录"], ["has", "有额度"], ["none", "无额度"], ["frozen", "已冻结"], ["used", "已用尽"]]
+        ${[["all", "全部"], ["active", "当前登录"], ["has", "有额度"], ["none", "无额度"], ["frozen", "已冻结"]]
           .map(([v, l]) => '<option value="' + v + '"' + (acctFilter === v ? " selected" : "") + ">" + l + "</option>").join("")}
       </select>
       <input id="acctsearch" class="sel" placeholder="按名字搜索…" value="${esc(acctSearch)}"
@@ -2306,7 +2309,7 @@ function viewAdmin() {
     <div class="card"><div class="lb">号池健康</div><div class="n">${normal}<small>/ ${chans.length}</small></div>
       <div class="foot">${down ? '<span style="color:var(--err)">' + down + " 个不通</span>" : "都通"}${untested ? " · " + untested + " 未探测" : ""}</div></div>
     <div class="card"><div class="lb">被冻结</div><div class="n" style="color:${frozen ? "var(--warn)" : "var(--fg)"}">${frozen}</div>
-      <div class="foot">限流 / 用尽，可手动解冻</div></div>
+      <div class="foot">号级限流标记，可逐个解冻；通道熔断在「接入」卡片放行</div></div>
     <div class="card"><div class="lb">额度缓存</div><div class="n">${s.quotaAccounts || 0}<small>/ ${chans.length}</small></div>
       <div class="foot">${s.lastRefresh ? esc(s.lastRefresh) : "还没刷过"}</div></div>
   </div>
@@ -2413,6 +2416,8 @@ function render() {
   for (const b of document.querySelectorAll("[data-unfreeze]")) {
     b.onclick = () => post("/proxy/unfreeze", { id: b.dataset.unfreeze });
   }
+  const eb = document.querySelector("[data-unfreeze-edge]");
+  if (eb) eb.onclick = () => { eb.disabled = true; post("/proxy/unfreeze", { edge: true }); };
   const pa = $("probeall");
   if (pa) pa.onclick = () => { pa.disabled = true; pa.textContent = "探测中…"; post("/proxy/probe", {}); };
 

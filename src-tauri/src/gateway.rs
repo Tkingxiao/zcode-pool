@@ -28,8 +28,6 @@ const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501
 const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
-const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
-
 const RATE_TTL_MS: u64 = 5 * 60 * 1000;
 
 pub const POLICY_EXPIRE: &str = "expire_first";
@@ -240,8 +238,11 @@ struct Inner {
 
     model_map: std::collections::BTreeMap<String, String>,
 
-    no_quota: HashMap<(String, String), u64>,
-
+    /// 号级冷却：账号 id → **解冻时刻**（不是打标时刻）。过期即自动重新入选，
+    /// `unfreeze` 可以手动提前清。
+    ///
+    /// 「额度用尽」以前想另存一张 `(号, 模型档)` 表，但它从来没有写入点 —— 没额度的号
+    /// 在 `candidates` 里直接按实时额度筛掉了，那张表已删。
     blocked: HashMap<String, u64>,
 
     /// 上游通道熔断到什么时候（0 = 没熔）。见 `EDGE_COOLDOWN_MS`
@@ -316,11 +317,6 @@ impl Gateway {
             for (id, t) in g.blocked.iter() {
                 if *t > now {
                     m.insert(id.clone(), json!("限流"));
-                }
-            }
-            for ((id, _), t) in g.no_quota.iter() {
-                if now.saturating_sub(*t) < NO_QUOTA_TTL_MS {
-                    m.insert(id.clone(), json!("用尽"));
                 }
             }
             m
@@ -425,6 +421,7 @@ impl Gateway {
             "routedQuota": quota_rows_for(&g, route_id.as_deref()),
             "clientQuota": quota_rows_for(&g, client_id.as_deref()),
             "blocked": g.blocked.values().filter(|t| **t > now_ms()).count(),
+            "edgeLeft": g.edge_until.saturating_sub(now_ms()),
             "policy": g.policy,
             "pinned": g.pinned,
             "sticky": g.sticky,
@@ -527,6 +524,15 @@ impl Gateway {
         let mut g = self.inner.lock().unwrap();
         g.edge_until = now_ms() + ms;
         g.edge_warned = false;
+    }
+
+    /// 手动解除通道熔断（换了出口/网络之后不想干等 TTL）。返回解除时还剩多少毫秒。
+    fn edge_reset(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        let left = g.edge_until.saturating_sub(now_ms());
+        g.edge_until = 0;
+        g.edge_warned = false;
+        left
     }
 
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
@@ -765,12 +771,13 @@ impl Gateway {
         Ok(self.console_status(paths))
     }
 
+    /// 手动提前解冻一个号：清掉号级冷却标记 + 把「连续失败」计数归零，返回清掉的条数。
+    /// 不解通道熔断 —— 那是另一层，见 `edge_reset`。
     pub fn unfreeze(&self, id: &str) -> usize {
         let mut g = self.inner.lock().unwrap();
-        let before = g.no_quota.len() + g.blocked.len();
-        g.no_quota.retain(|(a, _), _| a != id);
+        let before = g.blocked.len();
         g.blocked.remove(id);
-        let n = before - (g.no_quota.len() + g.blocked.len());
+        let n = before - g.blocked.len();
         if let Some(h) = g.health.get_mut(id) {
             h.streak = 0;
         }
@@ -1043,19 +1050,9 @@ impl Gateway {
             (g.policy.clone(), g.pinned.clone())
         };
         let mut list: Vec<Candidate> = vec![];
-        let model_k = model_key(model);
         for acc in &accounts {
             if policy == POLICY_PINNED && pinned.as_deref() != Some(acc.id.as_str()) {
                 continue;
-            }
-
-            {
-                let g = self.inner.lock().unwrap();
-                if let Some(t) = g.no_quota.get(&(acc.id.clone(), model_k.clone())) {
-                    if now_ms().saturating_sub(*t) < NO_QUOTA_TTL_MS {
-                        continue;
-                    }
-                }
             }
 
             {
@@ -2513,6 +2510,14 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                 let n = gw.unfreeze(id);
                 crate::flowlog::log("relay", "unfreeze", &format!("{id} 清了 {n} 条标记"));
+            }
+            if v.get("edge").and_then(Value::as_bool) == Some(true) {
+                let left = gw.edge_reset();
+                crate::flowlog::log(
+                    "relay",
+                    "unfreeze",
+                    &format!("手动解除通道熔断（原本还剩 {}s）", left / 1000),
+                );
             }
             return reply_json(req, 200, &gw.console_status(&paths));
         }
