@@ -26,9 +26,24 @@ const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501
 
 /// 上游自己 5xx：整条路都在冒烟，但通常是暂时的 —— 短熔断，恢复得比 405 快。
 const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
+
+/// 会话粘性的存活时间与条数上限。上限是防内存无界增长（每个会话一条）。
+const STICKY_TTL_MS: u64 = 30 * 60 * 1000;
+const STICKY_MAX: usize = 64;
+
+/// 同一个号两次额度重取之间的最小间隔。
+const REFRESH_MIN_GAP_MS: u64 = 15_000;
+
+/// 号池眼看要空时，最多愿意同步等这么久逼出真实额度，再决定要不要回 502。
+/// 等不到也放行 —— 刷新线程继续在后台跑，绝不把请求挂死。
+const EMPTY_WAIT_MS: u64 = 2_000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
 const RATE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// 401/402/403 的冷却比限流短：号只有一个的时候，5 分钟冻结等于把整个池子判死；
+/// 一分钟足够让它自己回到候选里，真死掉的凭证也会反复冷却、不会每发都试。
+const AUTH_COOLDOWN_MS: u64 = 60_000;
 
 pub const POLICY_EXPIRE: &str = "expire_first";
 pub const POLICY_MOST_LEFT: &str = "most_left";
@@ -192,7 +207,18 @@ struct Inner {
 
     serving: Option<Arc<AtomicBool>>,
     quota: HashMap<String, (u64, crate::quota::QuotaOverview)>,
-    sticky: Option<String>,
+
+    /// 粘性：会话指纹 → `(号 id, 最后使用时刻)`。
+    /// 以前是全局单值 `Option<String>`，等于把所有并发都钉在同一个号上，
+    /// 别的号的余量永远用不上。
+    sticky: HashMap<String, (String, u64)>,
+
+    /// 待重取额度的号：本地扣减到 0、上游拒绝、缓存缺失都会塞这里，由请求入口排空。
+    quota_dirty: Vec<String>,
+
+    /// 每个号上一次**开始**重取额度的时刻 —— 防同一个号被反复刷
+    quota_refresh_at: HashMap<String, u64>,
+
     refreshing: bool,
     last_refresh: Option<String>,
     last_billing: Option<String>,
@@ -355,7 +381,7 @@ impl Gateway {
             let mut m = serde_json::Map::new();
             for (id, t) in g.blocked.iter() {
                 if *t > now {
-                    m.insert(id.clone(), json!("限流"));
+                    m.insert(id.clone(), json!("冷却"));
                 }
             }
             m
@@ -463,7 +489,8 @@ impl Gateway {
             "edgeLeft": g.edge.left(now_ms()),
             "policy": g.policy,
             "pinned": g.pinned,
-            "sticky": g.sticky,
+            "sticky": g.sticky.values().map(|(id, _)| id.clone()).collect::<std::collections::BTreeSet<_>>(),
+            "stickySessions": g.sticky.len(),
             "modelMode": g.model_mode,
             "modelPinned": g.model_pinned,
             "models": models_seen(&g.quota),
@@ -479,7 +506,7 @@ impl Gateway {
             models_seen(&g.quota)
         };
         for m in ms {
-            if let Some(c) = self.sticky_order(self.candidates(paths, &m)).into_iter().next() {
+            if let Some(c) = self.sticky_order(self.candidates(paths, &m), "").into_iter().next() {
                 return Some(c.id);
             }
         }
@@ -525,7 +552,7 @@ impl Gateway {
         let mut g = self.inner.lock().unwrap();
         g.policy = policy;
         g.pinned = pinned.filter(|p| !p.trim().is_empty());
-        g.sticky = None;
+        g.sticky.clear();
         Ok(())
     }
 
@@ -566,6 +593,68 @@ impl Gateway {
     /// 手动解除通道熔断（换了出口/网络之后不想干等 TTL）。返回解除时还剩多少毫秒。
     fn edge_reset(&self) -> u64 {
         self.inner.lock().unwrap().edge.reset(now_ms())
+    }
+
+    /// 立刻重取这些号的额度：单号粒度、去重节流、跑在后台线程 —— 不挡请求路径。
+    ///
+    /// `wait_ms > 0` 只用在一处：候选已经空了、必须当场决定是不是回 502。等不到也照样
+    /// 返回 0，线程继续在后台跑，绝不把请求挂死（返回 0 不代表失败）。
+    fn refresh_accounts(&self, paths: &Paths, ids: Vec<String>, wait_ms: u64, reason: &'static str) -> usize {
+        let now = now_ms();
+        let mut todo: Vec<String> = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            // 只留还在冷却期内的；过期的清掉，这张表不会无界增长
+            g.quota_refresh_at.retain(|_, t| now.saturating_sub(*t) < REFRESH_MIN_GAP_MS * 4);
+            for id in ids {
+                if g.quota_refresh_at.contains_key(&id) {
+                    continue;
+                }
+                g.quota_refresh_at.insert(id.clone(), now);
+                todo.push(id);
+            }
+        }
+        if todo.is_empty() {
+            return 0;
+        }
+        crate::flowlog::log("relay", "quota-refresh", &format!("为 {} 个号重取额度（{reason}）", todo.len()));
+        let inner = self.inner.clone();
+        let p2 = Paths { home: paths.home.clone() };
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            for id in &todo {
+                match store::account_quota(&p2, id) {
+                    Ok(ov) => {
+                        inner.lock().unwrap().quota.insert(id.clone(), (now_ms(), ov));
+                        n += 1;
+                    }
+                    Err(e) => crate::flowlog::log(
+                        "relay",
+                        "quota-refresh",
+                        &format!("{id} 重取失败：{}", crate::quota::body_snippet(&e)),
+                    ),
+                }
+            }
+            let _ = tx.send(n);
+        });
+        if wait_ms == 0 {
+            return 0;
+        }
+        rx.recv_timeout(Duration::from_millis(wait_ms)).unwrap_or(0)
+    }
+
+    /// 排空「该重取额度」队列 —— 本地扣到 0、上游拒绝、缓存缺失都会往里塞。
+    /// 放在请求入口跑：后台刷，这一发不挡。
+    fn drain_quota_dirty(&self, paths: &Paths) {
+        let ids = {
+            let mut g = self.inner.lock().unwrap();
+            std::mem::take(&mut g.quota_dirty)
+        };
+        if ids.is_empty() {
+            return;
+        }
+        self.refresh_accounts(paths, ids, 0, "待确认队列");
     }
 
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
@@ -1082,7 +1171,8 @@ impl Gateway {
             let g = self.inner.lock().unwrap();
             (g.policy.clone(), g.pinned.clone())
         };
-        let mut list: Vec<Candidate> = vec![];
+        let mut known: Vec<Candidate> = vec![];
+        let mut unknown: Vec<Candidate> = vec![];
         for acc in &accounts {
             if policy == POLICY_PINNED && pinned.as_deref() != Some(acc.id.as_str()) {
                 continue;
@@ -1096,43 +1186,53 @@ impl Gateway {
                     }
                 }
             }
-            let (expire, left) = {
-                let g = self.inner.lock().unwrap();
-                let Some((_, ov)) = g.quota.get(&acc.id) else { continue };
-                let mut best: Option<(Option<String>, f64)> = None;
-                for p in &ov.plans {
-                    let mut here = 0.0f64;
-                    let mut hit = false;
-                    for it in &p.items {
-                        if model_same(&it.name, model) {
-                            let r = it.remaining.unwrap_or(0.0);
-                            if r > 0.0 {
-                                hit = true;
-                                here += r;
+            // 有缓存 → 按该模型余量算；**没缓存不等于没额度** —— 标成待刷新、排到最后，
+            // 而不是像以前那样直接丢弃。那是历史 7364 次 `502 no-account` 的主因：
+            // 新加的号还没 warm、或某轮 warm 失败，号就凭空消失了。
+            let mut sized: Option<(Option<String>, f64)> = None;
+            let mut has_cache = false;
+            {
+                let mut g = self.inner.lock().unwrap();
+                if let Some((_, ov)) = g.quota.get(&acc.id) {
+                    has_cache = true;
+                    let mut best: Option<(Option<String>, f64)> = None;
+                    for p in &ov.plans {
+                        let mut here = 0.0f64;
+                        let mut hit = false;
+                        for it in &p.items {
+                            if model_same(&it.name, model) {
+                                let r = it.remaining.unwrap_or(0.0);
+                                if r > 0.0 {
+                                    hit = true;
+                                    here += r;
+                                }
                             }
                         }
-                    }
-                    if !hit {
-                        continue;
-                    }
-                    best = match best {
-                        None => Some((p.expire.clone(), here)),
-                        Some((be, bl)) => {
-                            let sooner = matches!((&p.expire, &be), (Some(x), Some(b)) if x < b)
-                                || (p.expire.is_some() && be.is_none());
-                            if sooner {
-                                Some((p.expire.clone(), here))
-                            } else {
-                                Some((be, bl + here))
-                            }
+                        if !hit {
+                            continue;
                         }
-                    };
+                        best = match best {
+                            None => Some((p.expire.clone(), here)),
+                            Some((be, bl)) => {
+                                let sooner = matches!((&p.expire, &be), (Some(x), Some(b)) if x < b)
+                                    || (p.expire.is_some() && be.is_none());
+                                if sooner {
+                                    Some((p.expire.clone(), here))
+                                } else {
+                                    Some((be, bl + here))
+                                }
+                            }
+                        };
+                    }
+                    sized = best;
+                } else if !g.quota_dirty.iter().any(|x| x == &acc.id) {
+                    g.quota_dirty.push(acc.id.clone());
                 }
-                match best {
-                    Some(b) => b,
-                    None => continue,
-                }
-            };
+            }
+            if has_cache && sized.is_none() {
+                continue;
+            }
+            let (expire, left) = sized.unwrap_or((None, -1.0));
             let Ok(full) = store::load_account(paths, &acc.id) else { continue };
             let Some(jwt) = crate::quota::candidate_tokens(&full.credentials, full.config.as_ref(), &secret)
                 .into_iter()
@@ -1140,47 +1240,81 @@ impl Gateway {
             else {
                 continue;
             };
-            list.push(Candidate {
+            let c = Candidate {
                 id: acc.id.clone(),
                 name: acc.name.clone(),
                 token: jwt,
                 mid: full.virtual_device_mid.unwrap_or_default(),
                 expire,
                 left,
-            });
+            };
+            if has_cache {
+                known.push(c);
+            } else {
+                unknown.push(c);
+            }
         }
         match policy.as_str() {
-            POLICY_MOST_LEFT => list.sort_by(|a, b| {
+            POLICY_MOST_LEFT => known.sort_by(|a, b| {
                 b.left.partial_cmp(&a.left).unwrap_or(std::cmp::Ordering::Equal).then(a.name.cmp(&b.name))
             }),
-            _ => list.sort_by(|a, b| a.expire.cmp(&b.expire).then(a.name.cmp(&b.name))),
+            _ => known.sort_by(|a, b| a.expire.cmp(&b.expire).then(a.name.cmp(&b.name))),
         }
-        list
+        // 余量未知的号一律排在有号的后面：只在没有可用号时才用它们
+        unknown.sort_by(|a, b| a.name.cmp(&b.name));
+        known.extend(unknown);
+        known
     }
 
-    fn sticky_order(&self, mut list: Vec<Candidate>) -> Vec<Candidate> {
-        if list.is_empty() {
+    /// 把该会话上次服务过的号挪到队首。空指纹 = **不加粘性**（看不懂的请求不钉号）。
+    ///
+    /// 以前是全局一个 `sticky: Option<String>`，每次成功都重新钉住同一个号 —— 于是所有
+    /// 并发都从同一个号开始，别的号的余量永远用不上。按会话分桶之后：同一场对话仍然
+    /// 留在同一个号上（prompt 缓存局部性不变），新对话则优先领一个**还没被别的会话占用**
+    /// 的号 —— 不然两个新项目都会照队首挤到同一个号上，分摊就等于没做。
+    fn sticky_order(&self, mut list: Vec<Candidate>, skey: &str) -> Vec<Candidate> {
+        if list.is_empty() || skey.is_empty() {
             return list;
         }
         let mut g = self.inner.lock().unwrap();
         if g.policy == POLICY_PINNED {
             return list;
         }
-        let cur = g.sticky.clone();
-        if let Some(id) = cur {
-            if let Some(i) = list.iter().position(|c| c.id == id) {
+        let now = now_ms();
+        g.sticky.retain(|_, (_, t)| now.saturating_sub(*t) < STICKY_TTL_MS);
+        if let Some((id, _)) = g.sticky.get(skey) {
+            if let Some(i) = list.iter().position(|c| &c.id == id) {
                 list.rotate_left(i);
                 return list;
             }
         }
-        g.sticky = list.first().map(|c| c.id.clone());
+        // 新会话（或原来那个号已经不在候选里了）：挑一个别人没占的号
+        let used: std::collections::HashSet<String> = list
+            .iter()
+            .filter(|c| g.sticky.values().any(|(id, _)| id == &c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        let i = pick_for_new_session(&list, &used);
+        let id = list[i].id.clone();
+        if g.sticky.len() >= STICKY_MAX {
+            // 到上限就丢最久没用的那条，这张表不许无界增长
+            if let Some(k) = g.sticky.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                g.sticky.remove(&k);
+            }
+        }
+        g.sticky.insert(skey.to_string(), (id, now));
+        list.rotate_left(i);
         list
     }
 
-    fn set_sticky(&self, id: &str) {
+    /// 请求成功后把这一发实际用的号记回该会话（顺带续命）。
+    fn set_sticky(&self, skey: &str, id: &str) {
+        if skey.is_empty() {
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
         if g.policy != POLICY_PINNED {
-            g.sticky = Some(id.to_string());
+            g.sticky.insert(skey.to_string(), (id.to_string(), now_ms()));
         }
     }
 
@@ -1335,6 +1469,99 @@ fn upstream_verdict(status: u16, snip: &str) -> (&'static str, u64) {
     }
 }
 
+/// 把一次请求花掉的 token **就地扣进**额度缓存余量。
+///
+/// 缓存原本 5 分钟才刷一次：长流把一个号吃干之后，池子还会继续以为它有余量，
+/// 于是「用完不主动切」。这里先本地扣，下一发请求就看得见。
+///
+/// ⚠ 只当**怀疑**用：扣到 0 时调用方去触发一次真实刷新确认，绝不凭估算就把号踢出池。
+/// 所以宁少勿多 —— 缓存命中的 `cache_read_input_tokens` 故意不计（多扣会把还有余量的
+/// 号误判成空，那正是我们要修的毛病）。
+/// 返回是否因此把某一档扣到了 0。
+fn drain_cached(ov: &mut crate::quota::QuotaOverview, model: &str, spent: u64) -> bool {
+    if spent == 0 {
+        return false;
+    }
+    let t = spent as f64;
+    let mut zeroed = false;
+    {
+        let mut one = |it: &mut crate::quota::QuotaItem| {
+            if !model_same(&it.name, model) {
+                return;
+            }
+            let Some(r) = it.remaining else { return };
+            let left = (r - t).max(0.0);
+            if left <= 0.0 {
+                zeroed = true;
+            }
+            it.used = Some(it.used.unwrap_or(0.0) + (r - left));
+            it.remaining = Some(left);
+            if let Some(tt) = it.total.filter(|tt| *tt > 0.0) {
+                it.percent_used = Some(((tt - left) / tt) * 100.0);
+            }
+        };
+        for it in ov.items.iter_mut() {
+            one(it);
+        }
+        for p in ov.plans.iter_mut() {
+            for it in p.items.iter_mut() {
+                one(it);
+            }
+        }
+    }
+    zeroed
+}
+
+/// 会话指纹：API Key + `system` + 第一条 `messages` 里的全部文本，SHA-256 前 16 字节。
+///
+/// 同一场对话继续钉同一个号（prompt 缓存局部性不受影响），不同对话、不同客户端
+/// 自然分摊到不同号 —— 这就是「同时只能用一个号的额度」的解法。
+/// 解析不出来就返回空串，空串表示**不加粘性**：宁可换号，也不把看不懂的请求钉死。
+///
+/// 已知边界：`system` 写成字符串与写成块数组的指纹不同（块里的 `"type":"text"` 也是文本）。
+/// 只要同一场对话的写法稳定就没问题，写法变了不过是重新钉一次号，不影响正确性。
+fn session_key(body: &[u8], key_tag: &str) -> String {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return String::new();
+    };
+    let mut h = Sha256::new();
+    h.update(b"zpool-sess|");
+    h.update(key_tag.as_bytes());
+    h.update([0u8]);
+    let mut saw = false;
+    if let Some(s) = v.get("system") {
+        saw |= push_strings(s, &mut h, 0);
+        h.update([1u8]);
+    }
+    if let Some(m) = v.get("messages").and_then(Value::as_array).and_then(|a| a.first()) {
+        saw |= push_strings(m, &mut h, 0);
+    }
+    // 一个文本都没抓到（比如空 messages）就别钉号 —— 否则这类请求会全落在同一个常量指纹上
+    if !saw {
+        return String::new();
+    }
+    let digest = h.finalize();
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 按文档顺序收集字符串叶子喂进哈希，返回「有没有抓到文本」。
+/// 键名不参与，这样同一份内容换个键序不会变指纹（`serde_json::Map` 默认按键排序，本就确定性）。
+fn push_strings(v: &Value, h: &mut Sha256, depth: usize) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            h.update(s.as_bytes());
+            h.update([0u8]);
+            !s.trim().is_empty()
+        }
+        Value::Array(a) => a.iter().fold(false, |acc, x| push_strings(x, h, depth + 1) || acc),
+        Value::Object(o) => o.values().fold(false, |acc, x| push_strings(x, h, depth + 1) || acc),
+        _ => false,
+    }
+}
+
 fn account_session(id: &str, seed: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"zpool-sid|");
@@ -1381,6 +1608,12 @@ struct Meter<R> {
 
     first_at: Option<u64>,
 
+    /// 本地扣减额度要落在这个号上（`rec.acct` 是显示名，不够唯一）
+    acct_id: String,
+
+    /// 实际发给上游的模型名 —— 扣额度按它匹配，不是按调用方要的那个
+    up_model: String,
+
     rec: Option<crate::usage::UsageRecord>,
     path: std::path::PathBuf,
 }
@@ -1406,6 +1639,8 @@ impl<R: Read> Read for Meter<R> {
             if code.is_empty() {
                 code = peek_code(&self.tail);
             }
+            // 只有真正成功的一发才扣减 —— 失败或半途断掉的流不能算进额度
+            let served = self.rec.as_ref().is_some_and(|r| r.status == 200);
             if let Some(mut rec) = self.rec.take() {
                 rec.tokens_in = self.tokens_in;
                 rec.tokens_out = self.tokens;
@@ -1417,6 +1652,21 @@ impl<R: Read> Read for Meter<R> {
                 crate::usage::append(&self.path, &rec);
             }
             let mut g = self.inner.lock().unwrap();
+            if served {
+                // A1：把这一发花掉的 token 就地扣进额度缓存余量。以前缓存 5 分钟才刷一次，
+                // 长流把号吃干之后池子还在以为它有余量 —— 这就是「用完不主动切」的根因。
+                // 扣到 0 只当**怀疑**：塞进待确认队列，由真实刷新定案，绝不凭估算把号踢掉。
+                let spent = self.tokens_in.saturating_add(self.tokens);
+                if spent > 0 {
+                    if let Some((_, ov)) = g.quota.get_mut(&self.acct_id) {
+                        if drain_cached(ov, &self.up_model, spent)
+                            && !g.quota_dirty.iter().any(|x| x == &self.acct_id)
+                        {
+                            g.quota_dirty.push(self.acct_id.clone());
+                        }
+                    }
+                }
+            }
             g.last_total_ms = Some(ms);
 
             g.tokens_sum = g.tokens_sum.saturating_add(self.tokens);
@@ -1889,6 +2139,30 @@ fn external_body(
     serde_json::to_vec(&v).map_err(|e| (500, e.to_string()))
 }
 
+/// 选号：按 policy 排好、再把本会话上次用的号挪到队首；该模型全库无额度时回退到另一个模型。
+/// 刷完额度要能原样重跑一遍，所以把这段从 `handle_external` 里摘出来。
+fn pick_accounts(gw: &Gateway, paths: &Paths, model: &mut String, skey: &str, mmode: &str) -> Vec<Candidate> {
+    let mut list = gw.sticky_order(gw.candidates(paths, model), skey);
+    if list.is_empty() && mmode == MODEL_AUTO {
+        for alt in EXTERNAL_MODELS.iter().filter(|m| **m != model.as_str()) {
+            let c2 = gw.sticky_order(gw.candidates(paths, alt), skey);
+            if !c2.is_empty() {
+                crate::flowlog::log("relay", "model-fallback", &format!("{model} 全库无额度 → 回退到 {alt}"));
+                *model = alt.to_string();
+                list = c2;
+                break;
+            }
+        }
+    }
+    list
+}
+
+/// 新会话该钉哪个号：按 policy 排好的顺序找第一个**还没被别的会话占用**的号；
+/// 全被占用就回到队首 —— 此时共用一个号好过把请求判成「池子里没人」。
+fn pick_for_new_session(list: &[Candidate], used: &std::collections::HashSet<String>) -> usize {
+    list.iter().position(|c| !used.contains(&c.id)).unwrap_or(0)
+}
+
 fn handle_external(
     req: tiny_http::Request,
     gw: &Gateway,
@@ -1982,30 +2256,41 @@ fn handle_external(
     }
     let agent = ab.build();
 
-    let mut cands = gw.sticky_order(gw.candidates(paths, &model));
+    // 会话指纹：同一场对话钉同一个号，不同对话/不同 Key 分摊到不同号。
+    let skey = session_key(body, key_tag);
+    // 上一轮攒下的「额度待确认」（扣到 0 / 被拒 / 没缓存）在这里排空，后台刷，不挡这一发。
+    gw.drain_quota_dirty(paths);
+    let mut cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode);
 
-    if cands.is_empty() && mmode == MODEL_AUTO {
-        for alt in EXTERNAL_MODELS.iter().filter(|m| **m != model) {
-            let c2 = gw.sticky_order(gw.candidates(paths, alt));
-            if !c2.is_empty() {
-                crate::flowlog::log("relay", "model-fallback", &format!("{model} 全库无额度 → 回退到 {alt}"));
-
-                model = alt.to_string();
-                cands = c2;
-                break;
-            }
+    if cands.is_empty() {
+        // 缓存可能只是过期，别据此就判「号池没人可用」：先限时重取一轮全量额度再决定。
+        // 不这么做就会出现「号今早 09:00 已重置、池子却说没号」—— 历史上 7364 次
+        // `no-account` 里相当一部分是这个。等不到也照常回 502，刷新线程继续在后台跑。
+        let ids: Vec<String> = store::list_accounts(paths)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        if !ids.is_empty() && gw.refresh_accounts(paths, ids, EMPTY_WAIT_MS, "判空前确认") > 0 {
+            cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode);
         }
     }
     if cands.is_empty() {
-
         let at = now_ms();
+        let n = store::list_accounts(paths).map(|v| v.len()).unwrap_or(0);
         crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
+        // 别说「没有号」了事完 —— 号明明在池里，只是这一发排不上。说清是哪两种原因。
+        let why = if n == 0 {
+            "号池是空的 —— 先在「账号库」加号".to_string()
+        } else {
+            format!("{n} 个号都排不上 {model}：要么该模型没额度，要么正在冷却（刚重取过一轮额度，日志可查）")
+        };
         return reply_json(
             slot.take().unwrap(),
             502,
             &json!({ "type": "error",
                      "error": { "type": "overloaded_error",
-                                "message": format!("号池里没有可用于 {model} 的号") } }),
+                                "message": why } }),
         );
     }
 
@@ -2088,14 +2373,21 @@ fn handle_external(
         //    上游自己挂了）换号只是把同一堵墙再撞一遍 —— 实测 405 三分钟内累计 2870 发。
         if !(200..300).contains(&status) {
             if SWITCH_STATUS.contains(&status) {
-                if status == 429 {
-                    gw.mark_blocked(&c.id, RATE_TTL_MS);
-                }
+                // 四类一律冷却。以前只有 429 冷却，于是 401/402/403 的号既不冻结也不重取
+                // 额度 —— 下一个请求仍从它开始，每一发都白烧一次往返。
+                let cool = if status == 429 { RATE_TTL_MS } else { AUTH_COOLDOWN_MS };
+                gw.mark_blocked(&c.id, cool);
+                // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL
+                gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
                 let d = backoff_ms(tried);
                 crate::flowlog::log(
                     "relay",
                     "switch",
-                    &format!("外部 {} HTTP {status} → 冷却/换下一个（退避 {d}ms）", c.name),
+                    &format!(
+                        "外部 {} HTTP {status} → 冷却 {}s 并换下一个（退避 {d}ms，已安排重取额度）",
+                        c.name,
+                        cool / 1000
+                    ),
                 );
                 std::thread::sleep(Duration::from_millis(d));
                 continue;
@@ -2191,7 +2483,7 @@ fn handle_external(
             }
             reader = Box::new(std::io::Cursor::new(head).chain(reader));
         }
-        gw.set_sticky(&c.id);
+        gw.set_sticky(&skey, &c.id);
         {
             let mut g = gw.inner.lock().unwrap();
             g.served += 1;
@@ -2239,6 +2531,9 @@ fn handle_external(
             bytes: 0,
             started: tried_at,
             first_at: None,
+
+            acct_id: c.id.clone(),
+            up_model: model.clone(),
 
             rec: Some(crate::usage::UsageRecord {
                 t: tried_at,
@@ -3111,5 +3406,98 @@ mod tests {
         assert_eq!(e.waiting(50), Some((50, true)));
         assert_eq!(e.waiting(200), None, "过期就不再挡请求");
         assert_eq!(e.left(200), 0);
+    }
+
+    fn item(name: &str, remaining: f64, total: f64) -> crate::quota::QuotaItem {
+        crate::quota::QuotaItem {
+            name: name.to_string(),
+            total: Some(total),
+            used: Some(total - remaining),
+            remaining: Some(remaining),
+            percent_used: Some((total - remaining) / total * 100.0),
+            unit: "token".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 真实形状：`candidates` 只读 `plans`，`items` 是给界面显示的，两边必须同步扣
+    fn overview(items: Vec<crate::quota::QuotaItem>) -> crate::quota::QuotaOverview {
+        let plans = vec![crate::quota::PlanSlot {
+            expire: Some("2026-10-26 09:00".to_string()),
+            items: items.clone(),
+            ..Default::default()
+        }];
+        crate::quota::QuotaOverview { items, plans, ..Default::default() }
+    }
+
+    #[test]
+    fn drain_only_touches_the_matched_model_and_both_copies() {
+        let mut ov = overview(vec![item("GLM-5.3-Flash", 100.0, 300.0), item("GLM-5.3", 50.0, 200.0)]);
+        assert!(!drain_cached(&mut ov, "GLM-5.3-Flash", 40));
+        assert_eq!(ov.items[0].remaining, Some(60.0));
+        assert_eq!(ov.plans[0].items[0].remaining, Some(60.0), "plans 不扣的话下一发仍按旧余量选号");
+        assert_eq!(ov.items[1].remaining, Some(50.0), "别的档不该动");
+        assert_eq!(ov.items[0].used, Some(240.0));
+        assert_eq!(ov.items[0].percent_used, Some(80.0));
+    }
+
+    #[test]
+    fn drain_floors_at_zero_and_reports_the_doubt() {
+        let mut ov = overview(vec![item("GLM-5.3-Flash", 10.0, 300.0)]);
+        assert!(drain_cached(&mut ov, "GLM-5.3-Flash", 999), "扣穿要回报，让调用方去刷新确认");
+        assert_eq!(ov.items[0].remaining, Some(0.0), "不许出现负余量");
+        assert_eq!(ov.items[0].used, Some(300.0));
+        assert_eq!(ov.items[0].percent_used, Some(100.0));
+    }
+
+    #[test]
+    fn drain_ignores_spending_it_cannot_attribute() {
+        let mut ov = overview(vec![item("GLM-5.3", 50.0, 200.0)]);
+        assert!(!drain_cached(&mut ov, "GLM-5.3", 0), "没花钱不该动");
+        assert!(!drain_cached(&mut ov, "GLM-4.5-Air", 500), "对不上档名不该动");
+        assert_eq!(ov.items[0].remaining, Some(50.0));
+        let mut bare = crate::quota::QuotaOverview::default();
+        assert!(!drain_cached(&mut bare, "GLM-5.3", 10));
+    }
+
+    #[test]
+    fn session_key_keeps_a_growing_conversation_on_the_same_account() {
+        let a = r#"{"model":"GLM-5.3-Flash","system":[{"type":"text","text":"你是 X"}],"messages":[{"role":"user","content":"第一条"}]}"#;
+        let b = r#"{"model":"GLM-5.3-Flash","system":[{"type":"text","text":"你是 X"}],"messages":[{"role":"user","content":"第一条"},{"role":"assistant","content":"答"},{"role":"user","content":"再来"}]}"#;
+        let other = r#"{"system":[{"type":"text","text":"你是 X"}],"messages":[{"role":"user","content":"另一个问题"}]}"#;
+        assert_eq!(session_key(a.as_bytes(), "k1"), session_key(b.as_bytes(), "k1"), "对话加长必须还钉在同一个号上（prompt 缓存局部性）");
+        assert_ne!(session_key(a.as_bytes(), "k1"), session_key(a.as_bytes(), "k2"), "不同 API Key 要分摊到不同号");
+        assert_ne!(session_key(a.as_bytes(), "k1"), session_key(other.as_bytes(), "k1"));
+    }
+
+    #[test]
+    fn a_new_session_prefers_an_account_nobody_else_holds() {
+        let cand = |id: &str| Candidate {
+            id: id.to_string(),
+            name: id.to_string(),
+            token: String::new(),
+            mid: String::new(),
+            expire: None,
+            left: 0.0,
+        };
+        let list = vec![cand("A"), cand("B"), cand("C")];
+        let used = |ids: &[&str]| -> std::collections::HashSet<String> {
+            ids.iter().map(|s| s.to_string()).collect()
+        };
+
+        assert_eq!(pick_for_new_session(&list, &used(&[])), 0, "全新池子用队首");
+        assert_eq!(pick_for_new_session(&list, &used(&["A"])), 1, "A 被占了就给 B，别继续挤 A");
+        assert_eq!(pick_for_new_session(&list, &used(&["A", "B"])), 2);
+        assert_eq!(pick_for_new_session(&list, &used(&["A", "B", "C"])), 0, "全被占用就回队首：共用好过把请求判成空池");
+    }
+
+    #[test]
+    fn session_key_declines_to_pin_what_it_cannot_read() {
+        assert_eq!(session_key(b"not json", "k"), "", "解析不出来就不加粘性");
+        assert_eq!(session_key(b"", "k"), "");
+        let empty_msgs = r#"{"model":"GLM-5.3","messages":[]}"#;
+        assert_eq!(session_key(empty_msgs.as_bytes(), "k"), "", "空对话钉不出意义，全落一个常量指纹反而更糟");
+        let blanks = r#"{"system":"","messages":[{"content":"  "}]}"#;
+        assert_eq!(session_key(blanks.as_bytes(), "k"), "", "只有空白文本也算读不到");
     }
 }

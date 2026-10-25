@@ -853,7 +853,7 @@ function viewChan() {
             '<th class="num">成功率</th><th class="num">连败</th><th>上次探测</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>"
           : emptyState("inbox", "号池是空的 —— 先去「账号库」加号")) +
     '<div class="foot-note">探测走的是<b>额度接口</b>（免费、不用验证码），不真发模型请求 —— 那会烧号的额度。' +
-    "「解冻」清掉本地的「限流」标记（那是<b>号级</b>的），上游恢复了就不用干等 TTL；" +
+    "「解冻」清掉本地的「冷却」标记（那是<b>号级</b>的：429 冷却 5 分钟，401/402/403 一分钟），上游恢复了就不用干等；" +
     "<b>通道级</b>熔断要整个上游通道都不通时才触发，在「接入」卡片里手动放行。</div></div>";
 }
 
@@ -2309,7 +2309,7 @@ function viewAdmin() {
     <div class="card"><div class="lb">号池健康</div><div class="n">${normal}<small>/ ${chans.length}</small></div>
       <div class="foot">${down ? '<span style="color:var(--err)">' + down + " 个不通</span>" : "都通"}${untested ? " · " + untested + " 未探测" : ""}</div></div>
     <div class="card"><div class="lb">被冻结</div><div class="n" style="color:${frozen ? "var(--warn)" : "var(--fg)"}">${frozen}</div>
-      <div class="foot">号级限流标记，可逐个解冻；通道熔断在「接入」卡片放行</div></div>
+      <div class="foot">号级冷却标记，可逐个解冻；通道熔断在「接入」卡片放行</div></div>
     <div class="card"><div class="lb">额度缓存</div><div class="n">${s.quotaAccounts || 0}<small>/ ${chans.length}</small></div>
       <div class="foot">${s.lastRefresh ? esc(s.lastRefresh) : "还没刷过"}</div></div>
   </div>
