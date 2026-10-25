@@ -42,3 +42,6 @@ capture.ps1
 src-tauri/assets/system_prompt.json
 
 __pycache__/
+
+# 本机 cargo 国内镜像配置，不进仓库
+.cargo/config.toml
