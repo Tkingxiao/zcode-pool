@@ -24,6 +24,16 @@ const EDGE_COOLDOWN_MS: u64 = 60_000;
 /// 405 是其中最常见的一个，另外兜进这张表的都是同一种形状，见 `handle_external`。
 const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501, 505];
 
+/// 「关掉再打开」时，重新 bind 愿意重试多久。
+/// 复刻实测（同一个探针跑三遍，结果不一样）：关掉那一发如果还在途（对话测试 29s、流式最长 600s），
+/// 监听 socket 不会立刻让开 —— 头一遍立刻 bind 直接吃 `os error 10048`，另两遍又能立刻绑上。
+/// 反复连一发去踢它（见 `wait_port_free`），观测 0.3s～2.4s 之间让开，所以预算给到 4s 而不是赌一次。
+/// `stop()` 那边只踢 1.5s（它不该把开关点下去卡住太久），剩下的容忍放在 `start()`。
+const PORT_RELEASE_WAIT_MS: u64 = 4_000;
+
+/// `stop()` 那一侧踢港口的预算。比 bind 重试短 —— 关一下不该让开关卡好几秒。
+const STOP_POKE_BUDGET_MS: u64 = 1_500;
+
 /// 上游自己 5xx：整条路都在冒烟，但通常是暂时的 —— 短熔断，恢复得比 405 快。
 const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
 
@@ -1068,11 +1078,11 @@ impl Gateway {
             }
         }
 
-        let server = tiny_http::Server::http(("0.0.0.0", port))
-            .map_err(|e| crate::i18n::trf("err.gw.bind", &[("e", &e.to_string())]))?;
+        // 带重试：从「关」过来的那一发如果还没收尾，端口会占着 0.3～2.4s 才让开（实测），
+        // 赌一次判定就是用户看到的「关了就再也打不开」。
+        let server = bind_server(port, PORT_RELEASE_WAIT_MS)?;
         let stop = Arc::new(AtomicBool::new(false));
         let serving = Arc::new(AtomicBool::new(true));
-        let server = Arc::new(server);
         {
             let mut g = self.inner.lock().unwrap();
             g.running = true;
@@ -1145,7 +1155,9 @@ impl Gateway {
         let Some(s) = stop else { return };
         s.store(true, Ordering::Relaxed);
 
-        if let Some(srv) = server {
+        // 顺序要紧：unblock 叫醒等在消息队列上的收包线程，等它退出（它手里那份 Arc 一放，
+        // Arc<Server> 归零才会跑 Drop —— Drop 才是真正关监听 socket 的地方）
+        if let Some(srv) = &server {
             srv.unblock();
         }
         if let Some(sv) = serving {
@@ -1156,7 +1168,23 @@ impl Gateway {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
-        crate::flowlog::log("relay", "stop", &format!("port={port}"));
+        // 先给最后一份 Arc 撒手 —— Arc<Server> 归零时跑的 Drop，才是真正关监听 socket 的地方。
+        // 顺序不能反：还攥着它的时候探端口，永远探到「在应答」，白等一整段预算。
+        drop(server);
+        // Drop 只是「设停止标记 + 自连一次」，接受线程要跑完手上那一轮才撒手监听 socket。
+        // 下面这段探测一边等一边补踢，观测 0～500ms 让开；超预算就是真有一条连接没收尾。
+        let released = wait_port_free(port, STOP_POKE_BUDGET_MS);
+        match released {
+            Some(ms) => crate::flowlog::log("relay", "stop", &format!("port={port} 释放耗时 {ms}ms")),
+            None => crate::flowlog::log(
+                "relay",
+                "stop-port-held",
+                &format!(
+                    "port={port} 踢了 {STOP_POKE_BUDGET_MS}ms 端口仍被占：有一发请求还没收尾（面板页开着、\
+或对话测试/流式在飞，最长 600s），监听 socket 要等它结束才放。这时打开会报端口被占用，等一会儿再点"
+                ),
+            ),
+        }
     }
 
     pub fn refresh_quota(&self, paths: &Paths, force: bool) -> Result<usize, String> {
@@ -1813,6 +1841,43 @@ impl<R: Read> Read for Meter<R> {
         let (bytes, tokens) = (g.bytes_out, g.tokens_sum);
         g.meter.push((now, bytes, tokens));
         Ok(n)
+    }
+}
+
+/// bind 带重试。`stop()` 已经尽力把端口踢开了，但最后一次 kick 的收尾是异步的
+/// （接受线程要跑完那一轮 accept 才撒手），留 250ms 一轮的余量比直接报错划算。
+/// 真被别人占了（另一个程序、或还有一个旧进程在听）就重试到超时，报 `err.gw.bind`。
+fn bind_server(port: u16, wait_ms: u64) -> Result<Arc<tiny_http::Server>, String> {
+    let deadline = now_ms() + wait_ms;
+    loop {
+        match tiny_http::Server::http(("0.0.0.0", port)) {
+            Ok(s) => return Ok(Arc::new(s)),
+            Err(e) => {
+                if now_ms() >= deadline {
+                    return Err(crate::i18n::trf(
+                        "err.gw.bind",
+                        &[("port", &port.to_string()), ("e", &e.to_string())],
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+/// 反复连一次 `port` 直到它不再应答 —— 连上 = 把阻塞在 `accept()` 里的接受线程踢醒，
+/// 它醒来看到停止标记就退出，监听 socket 随之关闭（连接被秒断，不会留下半截请求）。
+/// 端口让出来了返回 `Some(等了多久)`（实测 0～500ms 级）；预算用尽还占着返回 `None`。
+fn wait_port_free(port: u16, wait_ms: u64) -> Option<u64> {
+    let t0 = now_ms();
+    loop {
+        if !port_answers(port) {
+            return Some(now_ms() - t0);
+        }
+        if now_ms() - t0 >= wait_ms {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(60));
     }
 }
 
@@ -3688,6 +3753,42 @@ mod tests {
 
     const HTML: &str = "<!doctypehtml><html lang=\"zh-cn\"><title>405</title>";
     const JSON: &str = "{\"code\":3012,\"message\":\"unusual activity\"}";
+
+    // bind / 端口释放：不碰 Gateway，所以能在测试二进制里跑（一碰 Gateway 就 STATUS_ENTRYPOINT_NOT_FOUND）
+    #[test]
+    fn stop_releases_the_port_so_start_can_bind_again() {
+        // 挑高位端口，别撞用户的 8899
+        let port: u16 = 28991;
+        let server = bind_server(port, 0).expect("起手 bind");
+        assert!(port_answers(port), "bind 成功就该有人应答");
+
+        // 走一遍应用的收尾：放掉最后一份 Arc（Drop 设停止标记 + 自连一次），再探端口
+        drop(server);
+        let released = wait_port_free(port, 1_000);
+        assert!(released.is_some(), "端口没在 1s 内让出来，「关了就再也打不开」会复发");
+
+        // 让出来之后就该立刻 bind 得上
+        let again = bind_server(port, 0).expect("端口已释放还 bind 不上");
+        drop(again);
+        assert!(wait_port_free(port, 1_000).is_some(), "第二个监听器没收尾");
+    }
+
+    #[test]
+    fn bind_server_gives_up_within_budget_and_names_the_port() {
+        let port: u16 = 28992;
+        let held = bind_server(port, 0).expect("占位 bind");
+        let t0 = now_ms();
+        // Server 没有 Debug，不能 expect_err —— 手动拆
+        let err = match bind_server(port, 300) {
+            Ok(_) => panic!("端口被占着还 bind 成功，重试逻辑没生效"),
+            Err(e) => e,
+        };
+        let spent = now_ms() - t0;
+        assert!(spent >= 300 && spent < 2_000, "重试预算失控：{spent}ms");
+        assert!(err.contains("28992"), "报错要带上是哪个端口：{err}");
+        drop(held);
+        assert!(wait_port_free(port, 1_000).is_some(), "占位的监听器没收尾");
+    }
 
     #[test]
     fn blocked_path_trips_the_long_cooldown() {

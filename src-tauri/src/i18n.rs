@@ -61,7 +61,7 @@ pub fn init_from_settings(s: &crate::store::Settings) {
 const ZH: &[(&str, &str)] = &[
     ("err.write", "写入失败：{e}"),
     ("err.gw.already_running", "中继已经在运行了"),
-    ("err.gw.bind", "中继监听失败（端口被占用？）：{e}"),
+    ("err.gw.bind", "中继监听失败：端口 {port} 还没让出来（{e}）。一般是上一次监听的收尾连接还挂着 —— 等十几秒再点开；开着面板页的浏览器标签会占住这条监听，先关掉它，还不行就退出程序重开"),
     ("err.gw.no_client_config", "找不到 ZCode 的内置供应商配置（先在设置里确认 ZCode 路径）"),
     ("err.gw.no_start_plan", "配置里没有找到 Start Plan 供应商"),
     ("err.gw.no_base_url", "Start Plan 供应商里没有 baseUrl"),
@@ -236,7 +236,7 @@ const ZH: &[(&str, &str)] = &[
 const EN: &[(&str, &str)] = &[
     ("err.write", "Write failed: {e}"),
     ("err.gw.already_running", "The relay is already running"),
-    ("err.gw.bind", "Relay failed to listen (port taken?): {e}"),
+    ("err.gw.bind", "Relay can't listen: port {port} isn't free yet ({e}). Usually the previous listener is still being held open by a leftover connection — wait about ten seconds and switch it back on; a browser tab with the console page pinned keeps that listener busy, so close it first. Last resort: quit and restart the app."),
     ("err.gw.no_client_config", "ZCode's built-in provider config not found (check the ZCode path in Settings)"),
     ("err.gw.no_start_plan", "No Start Plan provider found in the config"),
     ("err.gw.no_base_url", "The Start Plan provider has no baseUrl"),

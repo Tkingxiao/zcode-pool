@@ -2461,7 +2461,12 @@ function render() {
   for (const b of document.querySelectorAll("[data-set]")) {
     b.onclick = () => {
       const k = b.dataset.set;
-      if (k === "external") post("/proxy/external", { on: b.dataset.v === "1" });
+      if (k === "external") {
+        // 关的时候要等端口让开（最长两秒多），不给反馈会被当成没点到、再点一次
+        b.disabled = true;
+        b.textContent = "切换中…";
+        post("/proxy/external", { on: b.dataset.v === "1" });
+      }
       else if (k === "port") post("/proxy/port", { port: Number(($("portin") || {}).value || 0) });
       else if (k === "refresh-quota") { b.disabled = true; b.textContent = "刷新中…"; post("/proxy/refresh-quota", {}); }
       else if (k === "keyadd") { b.disabled = true; b.textContent = "…"; post("/proxy/key-add", { key: (($("keyin") || {}).value || "").trim() }); }
