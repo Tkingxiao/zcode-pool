@@ -856,7 +856,9 @@ function viewChan() {
     "「解冻」清掉本地的「冷却」标记（那是<b>号级</b>的：429 冷却 5 分钟，401/402/403 一分钟），上游恢复了就不用干等；" +
     "<b>通道级</b>熔断要整个上游通道都不通时才触发，在「接入」卡片里手动放行。" +
     "「对话测试」<b>真发一发</b> <span class=\"mono\">hi</span> 给模型（<span class=\"mono\">max_tokens</span> 很小，几乎不花额度），" +
-    "用来确认这个号此刻到底能不能出话；它只报结果，不会因此冷却号或熔断通道。</div></div>";
+    "用来确认这个号此刻到底能不能出话；它只报结果，不会因此冷却号或熔断通道。" +
+    "一个号最多试 <b>4</b> 份候选凭证 —— 第一份常常是端点根本不认的 provider apiKey，" +
+    "试通的那一份会只记指纹存到账号上，以后转发就用它；添加账号 / 与当前登录同步时会自动做一遍。</div></div>";
 }
 
 // 对话测试的结果按号驻留在这里：控制台每轮 status 都会重渲染整张表，
@@ -867,15 +869,27 @@ const chatResults = {};
 // 也不让这里的返回值污染全局 S，所以走 chatTest() 自己发的 fetch。
 function chatResultView(d, httpOk) {
   const ms = d.ms == null ? "" : (d.ms >= 1000 ? " · " + (d.ms / 1000).toFixed(1) + "s" : " · " + d.ms + "ms");
-  if (d.ok) return { cls: "ok", text: "收到回复" + ms, title: "「" + (d.reply || "") + "」" };
+  const c = d.credential;
+  // 用的是第几份候选凭证要露出来：实测 #1 常常是 provider 的 coding-plan apiKey，
+  // 而 zcode-plan/anthropic 不认它（401），真能用的往往是 #2 的 JWT。
+  // 知道序号才知道「是换了凭证才通的」，而不是号本来就是好的。
+  const which = c && c.total > 1 ? " · 凭证#" + c.index + "/" + c.total : "";
+  if (d.ok) return {
+    cls: "ok", text: "收到回复" + ms + which,
+    title: "「" + (d.reply || "") + "」" + (c ? "\n用的是第 " + c.index + " 份候选凭证（" + c.sha8 + "…），已记住" + (c.persisted === false ? "（没能写盘）" : "") : ""),
+  };
+  const tried = Array.isArray(d.attempted) ? d.attempted.filter((x) => x && x.index).length : 0;
+  const many = tried > 1 ? " · 试过" + tried + "份" : "";
   if (d.status) {
-    // 标签只留结论：定性与「真跑会被冷却多久」都放 title，行内放不下（实测 439px 宽，
-    // 四分之一张表就是一枚标签）。
     const cd = d.would_cooldown_s ? "真跑会被冷却 " + d.would_cooldown_s + "s" : "";
-    const tip = [d.kind, cd, d.error, d.snippet].filter(Boolean).join("\n");
-    return { cls: "bad", text: "无回复 HTTP " + d.status + ms, title: tip };
+    const rows = (d.attempted || []).filter((a) => a && a.index)
+      .map((a) => "#" + a.index + " " + (a.sha8 || "") + " → " + (a.kind || a.status || "")).join("\n");
+    return {
+      cls: "bad", text: "无回复 HTTP " + d.status + ms + many,
+      title: [d.kind, cd, d.snippet].filter(Boolean).join("\n") + (rows ? "\n—— 各份凭证 ——\n" + rows : ""),
+    };
   }
-  return { cls: "bad", text: httpOk ? "没拿到应答" : "网关报错", title: d.error || d.detail || "未知" };
+  return { cls: "bad", text: (httpOk ? "没拿到应答" : "网关报错") + many, title: d.error || d.detail || "未知" };
 }
 
 function acctChatBtns(c) {

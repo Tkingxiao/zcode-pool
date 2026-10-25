@@ -168,8 +168,12 @@ fn app_version(app: AppHandle) -> String {
 #[tauri::command]
 async fn capture_current(app: AppHandle, name: Option<String>) -> Result<Account, String> {
     let _guard = store_guard();
-    let r = store::capture_current(&Paths::detect(), name);
+    let paths = Paths::detect();
+    let r = store::capture_current(&paths, name);
     rebuild_tray(&app);
+    if let Ok(a) = &r {
+        relay().probe_after_capture(&paths, &a.id);
+    }
     r
 }
 
@@ -192,8 +196,12 @@ async fn delete_account(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account, String> {
     let _guard = store_guard();
-    let r = store::update_account_from_live(&Paths::detect(), &id);
+    let paths = Paths::detect();
+    let r = store::update_account_from_live(&paths, &id);
     rebuild_tray(&app);
+    if r.is_ok() {
+        relay().probe_after_capture(&paths, &id);
+    }
     r
 }
 
@@ -1102,6 +1110,8 @@ fn persist_oauth_account(
         let mut dup = accounts[i].clone();
         dup.hash = hash.clone();
         dup.credentials = credentials;
+        // 重新登录 = 凭证换了，记过的指纹必须作废
+        dup.plan_token = None;
         dup.config = Some(config);
         dup.updated_at = now_ts();
         if dup.virtual_device_mid.as_deref().map_or(true, |m| m.trim().is_empty()) {
@@ -1111,6 +1121,7 @@ fn persist_oauth_account(
             return Err("__superseded__".into());
         }
         save_account(paths, &dup)?;
+        relay().probe_after_capture(paths, &dup.id);
         *pending_oauth_guard() = None;
         return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
     }
@@ -1135,11 +1146,13 @@ fn persist_oauth_account(
         config: Some(config),
         virtual_device_mid: Some(mid.to_string()),
         virtual_arms_uid: Some(store::new_arms_uid()),
+        plan_token: None,
     };
     if !flow_still_ours() {
         return Err("__superseded__".into());
     }
     save_account(paths, &acc)?;
+    relay().probe_after_capture(paths, &acc.id);
     *pending_oauth_guard() = None;
     Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
 }

@@ -88,6 +88,16 @@ pub struct Account {
     pub virtual_device_mid: Option<String>,
     #[serde(default)]
     pub virtual_arms_uid: Option<String>,
+
+    /// 上次「对话测试」真正试通的那一个凭证的 sha256 前 16 位（不落明文）。
+    /// 空 = 没试过，按 `candidate_tokens` 的原顺序取第一个。
+    ///
+    /// 为什么要它：`candidate_tokens` 把 provider 的 coding-plan apiKey 排在最前，
+    /// 而 `zcode-plan/anthropic` 这条端点不认那种 key —— 实测三个有 apiKey 的号
+    /// 一律 401（空 body），唯一没有 apiKey、只能用 JWT 的号正常 200。
+    /// 顺序猜不对就该记住哪个真的能用，而不是每次都用错的那个。
+    #[serde(default)]
+    pub plan_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -645,6 +655,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         config,
         virtual_device_mid: None,
         virtual_arms_uid: None,
+        plan_token: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -688,6 +699,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         config: read_live_config(paths),
         virtual_device_mid: None,
         virtual_arms_uid: None,
+        plan_token: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -720,6 +732,8 @@ fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), S
     if src.credentials != live {
         src.credentials = live.clone();
         src.hash = live_hash;
+        // 凭证换人了，「上次试通的那一份」的指纹随之作废，别再拿旧提示去发请求
+        src.plan_token = None;
         changed = true;
     }
     if src.config.is_some() {
@@ -944,6 +958,7 @@ fn backfill_relay_pass_hash(paths: &Paths, target_id: &str, creds: &Value) {
     let Ok(mut acc) = load_account(paths, target_id) else { return };
     if acc.credentials != *creds {
         acc.credentials = creds.clone();
+        acc.plan_token = None;
         acc.updated_at = now_ts();
         if let Err(e) = save_account(paths, &acc) {
             eprintln!("relay 回填失败(不阻断切换): {e}");
@@ -1026,6 +1041,8 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     acc.hash = hash;
     acc.credentials = live;
     acc.config = read_live_config(paths);
+    // 同步 = 凭证整批换掉，旧指纹一并作废（能用的那一份由取号后的自动探测重新定）
+    acc.plan_token = None;
     acc.updated_at = now_ts();
     save_account(paths, &acc)?;
     Ok(acc)
@@ -1442,6 +1459,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 config,
                 virtual_device_mid: device_mid,
                 virtual_arms_uid: arms_uid,
+                plan_token: None,
             };
             new_accounts.push(acc);
             report.added.push(name);

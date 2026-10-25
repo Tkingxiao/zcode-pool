@@ -359,10 +359,15 @@ fn looks_like_token(v: &str) -> bool {
 }
 
 fn coding_plan_api_keys(config: Option<&Value>) -> Vec<String> {
+    // ⚠ provider 的 coding-plan apiKey 一律排在**最后**，不能打头。
+    // 2026-10-25 实测：三个带这种 key 的号用 key 发 `zcode-plan/anthropic` 全部 401（空 body），
+    // 换成同一个号的 `zcodejwttoken` 立刻 200 —— 它是给 Anthropic 兼容入口用的凭证，
+    // 不是这条端点认的上游凭证。以前它排第一，等于一上就用错的那一份。
+    // 不直接剔掉是因为：某些号可能只有它，留着当最后兜底比完全没有强。
     let mut keys = vec![];
     let providers = match config.and_then(|c| c.get("provider")).and_then(|p| p.as_object()) {
         Some(p) => p,
-        None => return keys,
+        None => return Vec::new(),
     };
     let mut ordered: Vec<(&String, &Value)> = providers.iter().collect();
     ordered.sort_by_key(|(_, p)| if p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) { 0 } else { 1 });
@@ -388,9 +393,6 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             }
         }
     };
-    for k in coding_plan_api_keys(config) {
-        tokens.push(k);
-    }
     let active = safe_decrypt(
         creds.get("oauth:active_provider").and_then(|v| v.as_str()),
         secret,
@@ -410,6 +412,10 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             map.and_then(|m| m.get(&key)).and_then(|v| v.as_str()).and_then(|v| safe_decrypt(Some(v), secret)),
             &mut tokens,
         );
+    }
+    // provider 的 coding-plan apiKey 放**最后**当兜底（理由见 `coding_plan_api_keys` 上的实测记录）
+    for k in coding_plan_api_keys(config) {
+        add(Some(k), &mut tokens);
     }
     tokens
 }
@@ -1617,7 +1623,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
 
 #[cfg(test)]
 mod tests {
-    use super::body_snippet;
+    use super::{body_snippet, candidate_tokens};
 
     #[test]
     fn snippet_flattens_a_block_page_onto_one_line() {
@@ -1642,5 +1648,30 @@ mod tests {
         // 按字符切，不能把一个汉字切成半个字节再拼进 String
         let s = body_snippet(&"拦".repeat(300));
         assert_eq!(s.chars().count(), 121);
+    }
+
+    #[test]
+    fn candidate_tokens_never_leads_with_the_provider_api_key() {
+        // 线上实测的形状：provider apiKey + zcodejwttoken + zai token 同时存在
+        let creds = serde_json::json!({
+            "zcodejwttoken": "jwt.value.that-is-long-enough-here",
+            "oauth:active_provider": "zai",
+            "oauth:zai:access_token": "zai.access.token.value.long.enough",
+        });
+        let config = serde_json::json!({ "provider": {
+            "account-provider:coding-plan:account:zai-team-coding-plan": {
+                "enabled": true, "options": { "apiKey": "sk-coding-plan-apikey-value-0123456789" }
+            }
+        }});
+        let t = candidate_tokens(&creds, Some(&config), "s3cret");
+        assert_eq!(t.first().map(String::as_str), Some("jwt.value.that-is-long-enough-here"), "打头必须是 JWT");
+        assert_eq!(t.last().map(String::as_str), Some("sk-coding-plan-apikey-value-0123456789"), "apiKey 只能垫底");
+
+        // 只有 apiKey 的号不能被清空凭证 —— 垫底也要留着
+        let only = candidate_tokens(&serde_json::json!({}), Some(&config), "s3cret");
+        assert_eq!(only.len(), 1);
+        // 没有 config 时不受影响
+        let none = candidate_tokens(&creds, None, "s3cret");
+        assert_eq!(none.len(), 2);
     }
 }

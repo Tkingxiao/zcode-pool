@@ -27,6 +27,10 @@ const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501
 /// 上游自己 5xx：整条路都在冒烟，但通常是暂时的 —— 短熔断，恢复得比 405 快。
 const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
 
+/// 对话测试最多试几个候选凭证。每一发都是真请求（会占一点点额度），
+/// 所以上限压低：现在的号最多 3 个去重后的候选，留一位富余。
+const MAX_PROBE_TOKENS: usize = 4;
+
 /// 会话粘性的存活时间与条数上限。上限是防内存无界增长（每个会话一条）。
 const STICKY_TTL_MS: u64 = 30 * 60 * 1000;
 const STICKY_MAX: usize = 64;
@@ -689,6 +693,41 @@ impl Gateway {
         self.refresh_accounts(paths, ids, 0, "待确认队列");
     }
 
+    /// 清掉某个号「上次试通的凭证」指纹（只在真存着时才落一次盘）。
+    fn drop_plan_hint(&self, paths: &Paths, id: &str) {
+        let mut acc = match store::load_account(paths, id) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        if acc.plan_token.take().is_none() {
+            return;
+        }
+        match store::save_account(paths, &acc) {
+            Ok(()) => crate::flowlog::log("relay", "token-hint", &format!("{id} 记住的凭证回 401，已清掉提示、回到默认顺序")),
+            Err(e) => crate::flowlog::log("relay", "token-hint", &format!("{id} 清提示失败：{e}")),
+        }
+    }
+
+    /// 取号 / 同步之后**后台**立刻试一次：把这个号真正能用的那一份凭证定下来。
+    ///
+    /// 不能留给第一发真实请求去猜 —— 实测 `candidate_tokens` 会把 provider 的
+    /// coding-plan apiKey 排到第一位，而那条端点不认它，于是三个号一上就被 401。
+    /// 放后台是因为「添加账号」的流程不该被一次模型请求卡住几秒到几十秒。
+    pub fn probe_after_capture(&self, paths: &Paths, id: &str) {
+        let me = self.clone();
+        let p = Paths { home: paths.home.clone() };
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let r = chat_test(&me, &p, &id);
+            let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            crate::flowlog::log(
+                "relay",
+                "probe-after-capture",
+                &format!("{} {}", id, if ok { "已自动定下可用凭证" } else { "试完所有凭证都没出话 —— 这个号可能不能用于反代" }),
+            );
+        });
+    }
+
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
         let secret = crate::zcrypto::default_secret(&paths.home);
         let acc = store::load_account(paths, id)?;
@@ -1266,10 +1305,9 @@ impl Gateway {
             }
             let (expire, left) = sized.unwrap_or((None, -1.0));
             let Ok(full) = store::load_account(paths, &acc.id) else { continue };
-            let Some(jwt) = crate::quota::candidate_tokens(&full.credentials, full.config.as_ref(), &secret)
-                .into_iter()
-                .next()
-            else {
+            let toks = crate::quota::candidate_tokens(&full.credentials, full.config.as_ref(), &secret);
+            // 有「上次真试过能通」的指纹就按它取；没有才照列表顺序取第一个
+            let Some(jwt) = toks.get(pick_token_index(&toks, full.plan_token.as_deref())).cloned() else {
                 continue;
             };
             let c = Candidate {
@@ -1478,6 +1516,21 @@ fn backoff_ms(attempt: usize) -> u64 {
     let capped = 2000u64.saturating_mul(1u64 << shift).min(60_000);
     let jitter = (now_ms() % 41) as i64 - 20; 
     ((capped as i64) * (100 + jitter) / 100).max(50) as u64
+}
+
+/// 凭证指纹：sha256 前 16 位。账号文件里只落这个，不落明文。
+fn token_sha16(s: &str) -> String {
+    let d = Sha256::digest(s.as_bytes());
+    d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// 按持久化的「上次试通的凭证指纹」选候选；对不上（凭证换了、指纹过期）就退回第一个，
+/// 让下一次对话测试重新去猜 —— 宁可退回原行为，也不要因为一条坏提示把号锁死。
+fn pick_token_index(tokens: &[String], hint: Option<&str>) -> usize {
+    match hint.filter(|h| !h.is_empty()) {
+        Some(h) => tokens.iter().position(|t| token_sha16(t) == h).unwrap_or(0),
+        None => 0,
+    }
 }
 
 /// 号级失败的冷却时长。**生产换号和对话测试共用**这一处判断 —— 两边各写一遍迟早会飘，
@@ -2284,12 +2337,10 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
         Err(e) => return fail(json!({ "error": format!("读不到这个号：{e}") })),
     };
     let secret = crate::zcrypto::default_secret(&paths.home);
-    let Some(token) = crate::quota::candidate_tokens(&acc.credentials, acc.config.as_ref(), &secret)
-        .into_iter()
-        .next()
-    else {
+    let toks = crate::quota::candidate_tokens(&acc.credentials, acc.config.as_ref(), &secret);
+    if toks.is_empty() {
         return fail(json!({ "error": "这个号没有可用凭证 —— 先重新登录一次" }));
-    };
+    }
     let mid = acc.virtual_device_mid.clone().unwrap_or_default();
     let model = test_model(gw, id);
     let sess = account_session(id, &day_seed());
@@ -2304,40 +2355,88 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
         Err((_, e)) => return fail(json!({ "model": model, "error": format!("组装请求失败：{e}") })),
     };
 
+    // 依次试这个号的候选凭证，**谁真的能用就记住谁**。
+    // 候选顺序本身靠不住：`candidate_tokens` 把 provider 的 coding-plan apiKey 排最前，
+    // 而这条端点不认那种 key —— 实测三个带 apiKey 的号一律 401（空 body），
+    // 唯一没有 apiKey、只能用 zcodejwttoken 的号正常 200。
+    // 上限 4 个：每一发都是真请求，再多就是在烧额度、撞网关。
+    let start = pick_token_index(&toks, acc.plan_token.as_deref());
+    let order: Vec<usize> = (0..toks.len()).map(|k| (start + k) % toks.len()).take(MAX_PROBE_TOKENS).collect();
     let proxy = gw.inner.lock().unwrap().relay_proxy.clone();
-    let t0 = now_ms();
-    let sent = set_relay_headers(relay_agent(proxy.as_deref(), 45).request("POST", &format!("{UPSTREAM}/v1/messages")), &token)
-        .send_bytes(&out_body);
-    let ms = now_ms().saturating_sub(t0);
-    let mut out = match sent {
-        Ok(r) => {
-            let status = r.status();
-            let mut buf = String::new();
-            let _ = r.into_reader().take(8192).read_to_string(&mut buf);
-            match extract_reply_text(&buf) {
-                Some(t) => json!({ "ok": true, "status": status, "ms": ms, "reply": t }),
-                None => json!({
-                    "ok": false, "status": status, "ms": ms,
-                    "error": format!("HTTP {status} 但应答里没有模型内容"),
-                    "snippet": crate::quota::body_snippet(&buf)
-                }),
+    let agent = relay_agent(proxy.as_deref(), 45);
+    let target = format!("{UPSTREAM}/v1/messages");
+    let mut tried: Vec<Value> = vec![];
+    let mut out: Value = json!({ "ok": false, "error": "没试出结果" });
+
+    for i in order {
+        let sha = token_sha16(&toks[i]);
+        let t0 = now_ms();
+        let sent = set_relay_headers(agent.request("POST", &target), &toks[i]).send_bytes(&out_body);
+        let ms = now_ms().saturating_sub(t0);
+        out = match sent {
+            Ok(r) => {
+                let status = r.status();
+                let mut buf = String::new();
+                let _ = r.into_reader().take(8192).read_to_string(&mut buf);
+                match extract_reply_text(&buf) {
+                    Some(t) => json!({ "ok": true, "status": status, "ms": ms, "reply": t }),
+                    None => json!({
+                        "ok": false, "status": status, "ms": ms,
+                        "kind": "HTTP 正常但应答里没有模型内容",
+                        "snippet": crate::quota::body_snippet(&buf)
+                    }),
+                }
             }
+            Err(ureq::Error::Status(code, r)) => {
+                let mut buf = String::new();
+                let _ = r.into_reader().take(600).read_to_string(&mut buf);
+                let snip = crate::quota::body_snippet(&buf);
+                let (kind, cool) = verdict_for_probe(code, &snip);
+                json!({
+                    "ok": false, "status": code, "ms": ms, "kind": kind, "snippet": snip,
+                    "would_cooldown_s": cool / 1000
+                })
+            }
+            Err(e) => json!({ "ok": false, "ms": ms, "kind": "网络错误", "error": e.to_string() }),
+        };
+
+        if out.get("ok").and_then(Value::as_bool) == Some(true) {
+            // 记住这一个：账号文件里只存 sha256 前 16 位，不存明文凭证
+            let mut saved = acc.clone();
+            saved.plan_token = Some(sha.clone());
+            let persisted = store::save_account(paths, &saved).is_ok();
+            if let Some(o) = out.as_object_mut() {
+                o.insert("credential".to_string(), json!({
+                    "index": i + 1,
+                    "total": toks.len(),
+                    "sha8": sha[..8].to_string(),
+                    "persisted": persisted,
+                    "wasRemembered": acc.plan_token.as_deref() == Some(sha.as_str()),
+                }));
+            }
+            tried.push(json!({ "index": i + 1, "sha8": sha[..8].to_string(), "ok": true }));
+            break;
         }
-        Err(ureq::Error::Status(code, r)) => {
-            let mut buf = String::new();
-            let _ = r.into_reader().take(600).read_to_string(&mut buf);
-            let snip = crate::quota::body_snippet(&buf);
-            let (kind, cool) = verdict_for_probe(code, &snip);
-            json!({
-                "ok": false, "status": code, "ms": ms, "kind": kind, "snippet": snip,
-                "would_cooldown_s": cool / 1000
-            })
-        }
-        Err(e) => json!({ "ok": false, "ms": ms, "error": e.to_string() }),
-    };
+        tried.push(json!({
+            "index": i + 1,
+            "sha8": sha[..8].to_string(),
+            "status": out.get("status").cloned().unwrap_or(Value::Null),
+            "kind": out.get("kind").cloned().unwrap_or_else(|| out.get("error").cloned().unwrap_or(Value::Null)),
+        }));
+    }
+
+    // 全都试不通：把提示清掉，别把一次失败的猜测固化成长期行为
+    if out.get("ok").and_then(Value::as_bool) != Some(true) && acc.plan_token.is_some() {
+        let mut cleared = acc.clone();
+        cleared.plan_token = None;
+        let _ = store::save_account(paths, &cleared);
+        tried.push(json!({ "note": "已清掉记住的凭证，回到默认顺序" }));
+    }
     if let Some(o) = out.as_object_mut() {
         o.insert("name".to_string(), json!(name));
         o.insert("model".to_string(), json!(model));
+        o.insert("attempted".to_string(), json!(tried));
+        o.insert("candidates".to_string(), json!(toks.len()));
     }
     crate::flowlog::log("relay", "chat-test", &format!("{}", out));
     out
@@ -2562,6 +2661,12 @@ fn handle_external(
                 // 额度 —— 下一个请求仍从它开始，每一发都白烧一次往返。
                 let cool = account_cooldown(status);
                 gw.mark_blocked(&c.id, cool);
+                if status == 401 {
+                    // 401 = 这一发用的凭证不被认。要是这个号还存着「上次试通」的指纹，说明它
+                    // 已经失效了（重新登录、token_version 被吊销都会这样）—— 清掉提示回到默认
+                    // 顺序，让人再点一次对话测试重新认一个，而不是抱着坏提示一路 401。
+                    gw.drop_plan_hint(paths, &c.id);
+                }
                 // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL
                 gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
                 let d = backoff_ms(tried);
@@ -3582,6 +3687,27 @@ mod tests {
         assert_eq!(account_cooldown(429), RATE_TTL_MS);
         assert_eq!(account_cooldown(401), AUTH_COOLDOWN_MS);
         assert!(AUTH_COOLDOWN_MS < RATE_TTL_MS, "凭证类失败不该把只有一个号的池子冻满五分钟");
+    }
+
+    #[test]
+    fn token_hint_picks_the_credential_that_actively_worked() {
+        // 这就是线上那三个号的形状：#1 是 provider apiKey（端点不认），#2 才是 JWT
+        let toks = vec!["apikey-that-endpoint-rejects".to_string(), "eyJhbGciOiJIUzI1NiJ9.jwt".to_string()];
+        assert_eq!(pick_token_index(&toks, None), 0, "没记过就按默认顺序");
+        let good = token_sha16(&toks[1]);
+        assert_eq!(pick_token_index(&toks, Some(&good)), 1, "记住是第 2 份就用第 2 份");
+        assert_eq!(pick_token_index(&toks, Some(&token_sha16(&toks[0]))), 0);
+    }
+
+    #[test]
+    fn stale_token_hint_falls_back_instead_of_locking_the_account_out() {
+        let toks = vec!["a-long-enough-token-value".to_string()];
+        // 凭证被重新登录换掉之后，记着的指针对不上 —— 只能退回默认顺序，不能因此不给发
+        assert_eq!(pick_token_index(&toks, Some("0000000000000000")), 0);
+        assert_eq!(pick_token_index(&toks, Some("")), 0);
+        assert_eq!(pick_token_index(&[], Some(&token_sha16("x"))), 0);
+        assert_ne!(token_sha16("a"), token_sha16("b"), "指纹得真能区分不同凭证");
+        assert_eq!(token_sha16("a").len(), 16);
     }
 
     #[test]
