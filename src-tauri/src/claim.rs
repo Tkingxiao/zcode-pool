@@ -261,7 +261,7 @@ fn http_err(prefix: &str, e: ureq::Error) -> String {
             .and_then(|v| ["msg", "message", "error"]
                 .iter()
                 .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)))
-            .unwrap_or_default();
+            .unwrap_or_else(|| crate::quota::body_snippet(&body));
         return format!("{prefix} HTTP {code}: {msg}");
     }
     format!("{prefix} {e}")

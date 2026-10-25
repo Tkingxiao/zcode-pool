@@ -418,6 +418,16 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
     http_get_json_mid(url, token, retry_429, None)
 }
 
+/// 拦截页 / 网关错误页是整页 HTML，原样拼进错误消息会把界面撑爆：压成一行再截断。
+pub(crate) fn body_snippet(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s: String = flat.chars().take(120).collect();
+    if flat.chars().count() > 120 {
+        s.push('…');
+    }
+    s
+}
+
 fn http_get_json_mid(
     url: &str,
     token: &str,
@@ -445,6 +455,11 @@ fn http_get_json_mid(
         match resp {
             Ok(r) => {
                 let text = r.into_string().map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+                // 边缘/网关也能用 **200** 塞回一页 HTML。放过去会让 `business_ok` 判成通过
+                // （字符串上取不到 `code`），界面就成了「号看着能用、额度一片空白」。
+                if text.trim_start().starts_with('<') {
+                    return Err(crate::i18n::trf("err.quota.blocked", &[("msg", &body_snippet(&text))]));
+                }
                 return Ok(if text.is_empty() {
                     Value::Null
                 } else {
@@ -474,7 +489,7 @@ fn http_get_json_mid(
                 let msg = serde_json::from_str::<Value>(&body)
                     .ok()
                     .and_then(|v| ["message", "msg", "error"].iter().find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)));
-                return Err(crate::i18n::trf("err.quota.http", &[("code", &code.to_string()), ("msg", &msg.unwrap_or_default())]));
+                return Err(crate::i18n::trf("err.quota.http", &[("code", &code.to_string()), ("msg", &msg.unwrap_or_else(|| body_snippet(&body)))]));
             }
             Err(e) => return Err(crate::i18n::trf("err.network", &[("e", &e.to_string())])),
         }
@@ -1597,5 +1612,35 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         refreshed_at: 0,
         source: String::new(),
         plans: slots,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_snippet;
+
+    #[test]
+    fn snippet_flattens_a_block_page_onto_one_line() {
+        let html = "<!doctype html>\n\n<html>\n  <body>\n    blocked\n  </body>\n</html>";
+        assert_eq!(body_snippet(html), "<!doctype html> <html> <body> blocked </body> </html>");
+    }
+
+    #[test]
+    fn snippet_cuts_long_bodies_and_marks_the_cut() {
+        let s = body_snippet(&"x".repeat(500));
+        assert_eq!(s.chars().count(), 121); // 120 + 省略号
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn snippet_keeps_a_short_json_message_intact() {
+        assert_eq!(body_snippet("{\"message\":\"quota limited\"}"), "{\"message\":\"quota limited\"}");
+    }
+
+    #[test]
+    fn snippet_survives_multibyte_cut() {
+        // 按字符切，不能把一个汉字切成半个字节再拼进 String
+        let s = body_snippet(&"拦".repeat(300));
+        assert_eq!(s.chars().count(), 121);
     }
 }

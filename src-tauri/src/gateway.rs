@@ -11,6 +11,21 @@ pub const UPSTREAM: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 pub const DEFAULT_PORT: u16 = 8899;
 const SWITCH_STATUS: [u16; 4] = [401, 402, 403, 429];
 const MAX_TRIES: usize = 4;
+
+/// 上游边缘（阿里云 WAF）按**出口**拦下这条通道时回 **405 + HTML 拦截页**，请求根本没进业务服务。
+/// 与号无关，两条实测：匿名假 token 照样 405（GET/POST/PUT 全都一样，而同域名的别的路径照常回
+/// 404/400）；换一个出口再发同一发，就变成业务侧的 401。
+/// 所以 405 **不进 `SWITCH_STATUS`**：换号纯属浪费，接着撞只会让拦得更久（实测三分钟内累计 2870 发）。
+/// 改为整条通道熔断，期间连上游都不碰。
+const EDGE_COOLDOWN_MS: u64 = 60_000;
+
+/// 这一类状态码表示**这条路**不对（路由被关、方法不被允许、请求形状超限、被合规封掉），
+/// 而不是**这个号**不对。撞上就熔断整条通道，别把同一堵墙按号撞一遍。
+/// 405 是其中最常见的一个，另外兜进这张表的都是同一种形状，见 `handle_external`。
+const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501, 505];
+
+/// 上游自己 5xx：整条路都在冒烟，但通常是暂时的 —— 短熔断，恢复得比 405 快。
+const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
 const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
@@ -228,6 +243,12 @@ struct Inner {
     no_quota: HashMap<(String, String), u64>,
 
     blocked: HashMap<String, u64>,
+
+    /// 上游通道熔断到什么时候（0 = 没熔）。见 `EDGE_COOLDOWN_MS`
+    edge_until: u64,
+
+    /// 熔断期内是否已经记过日志 —— 被挡下的请求不再逐条刷日志
+    edge_warned: bool,
 }
 
 #[derive(Clone, Default)]
@@ -499,6 +520,13 @@ impl Gateway {
         g.blocked.retain(|_, t| *t > now);
         let cur = g.blocked.get(id).copied().unwrap_or(0);
         g.blocked.insert(id.to_string(), cur.max(now + ms));
+    }
+
+    /// 熔断整条上游通道 `ms`：期间 `handle_external` 直接回 503，一个请求都不往上游发。
+    fn edge_trip(&self, ms: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.edge_until = now_ms() + ms;
+        g.edge_warned = false;
     }
 
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
@@ -1256,6 +1284,27 @@ fn backoff_ms(attempt: usize) -> u64 {
     ((capped as i64) * (100 + jitter) / 100).max(50) as u64
 }
 
+/// 非 2xx 且**不是号的问题**时，这条应答怎么定性：`(给人看的标签, 熔断多久)`，0 = 不熔断。
+///
+/// 优先级：先查明确列出的通道级状态码（路由被关、方法不许、501/505 这种"这条路本身不通"），
+/// 再兜 5xx（上游自己挂了，多半是暂时的，短熔断），再兜"没列进来但拿回一页 HTML"
+/// —— 实测的 405 拦页就是这一类形状。
+/// 剩下的 4xx 多半是这一发请求本身不对：**不熔断**，免得一个客户端的坏请求把整池锁 60 秒。
+/// 四种都不换号 —— 与号无关时换下一个只是把同一堵墙再撞一遍。
+fn upstream_verdict(status: u16, snip: &str) -> (&'static str, u64) {
+    if PATH_STATUS.contains(&status) {
+        ("通道被拦（与号无关，换号无意义）", EDGE_COOLDOWN_MS)
+    } else if status >= 500 {
+        ("上游故障", UPSTREAM_COOLDOWN_MS)
+    } else if snip.starts_with('<') {
+        ("通道被拦（HTML 拦截页，换号无意义）", EDGE_COOLDOWN_MS)
+    } else if status >= 400 {
+        ("未预期 4xx", 0u64)
+    } else {
+        ("未预期应答（既非 2xx 也非 4xx/5xx）", 0u64)
+    }
+}
+
 fn account_session(id: &str, seed: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"zpool-sid|");
@@ -1547,6 +1596,49 @@ fn norm_path(url: &str) -> String {
     s
 }
 
+/// 只保证单调、不保证精确：数 `system` / `messages` / `tools` 下的字符串叶子。
+/// CJK 全角按 1 字≈1 token、其余按 4 字符≈1 token —— 纯按 4 折算会把中文低估约 4 倍，
+/// 客户端据此预算就会塞过头。
+fn estimate_input_tokens(raw: &[u8]) -> u64 {
+    fn is_wide(c: char) -> bool {
+        let u = c as u32;
+        (0x3000..=0x30ff).contains(&u)
+            || (0x3400..=0x4dbf).contains(&u)
+            || (0x4e00..=0x9fff).contains(&u)
+            || (0xac00..=0xd7af).contains(&u)
+            || (0xf900..=0xfaff).contains(&u)
+            || (0xff00..=0xffef).contains(&u)
+    }
+    fn walk(v: &Value, wide: &mut u64, ascii: &mut u64) {
+        match v {
+            Value::String(s) => {
+                for c in s.chars() {
+                    if is_wide(c) {
+                        *wide += 1;
+                    } else {
+                        *ascii += 1;
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, wide, ascii)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, wide, ascii)),
+            _ => {}
+        }
+    }
+    let (mut wide, mut ascii) = (0u64, 0u64);
+    if let Ok(v) = serde_json::from_slice::<Value>(raw) {
+        for k in ["system", "messages", "tools"] {
+            if let Some(x) = v.get(k) {
+                walk(x, &mut wide, &mut ascii);
+            }
+        }
+    }
+    if wide + ascii == 0 {
+        return (raw.len() as u64 / 4).max(1);
+    }
+    (wide + ascii.div_ceil(4)).max(1)
+}
+
 fn web_dirs() -> Vec<std::path::PathBuf> {
     let mut v = Vec::new();
     if let Ok(d) = std::env::var("ZPOOL_WEB_DIR") {
@@ -1685,12 +1777,18 @@ fn reply_json_masked(req: tiny_http::Request, code: u16, v: &Value, from_loopbac
 }
 
 fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
-    static B: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
-    if let Some(v) = B.get() {
-        return Ok(v.clone());
+    // 按抽取来源缓存：设置里换了 ZCode 路径就得重抽，否则整个进程寿命内都用旧的两块。
+    static B: std::sync::Mutex<Option<(String, Vec<Value>)>> = std::sync::Mutex::new(None);
+    let key = crate::prompt::cache_key(paths);
+    let lock = B.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, v)) = lock.as_ref() {
+        if *k == key {
+            return Ok(v.clone());
+        }
     }
+    drop(lock);
     let v = crate::prompt::system_blocks(paths)?;
-    let _ = B.set(v.clone());
+    *B.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, v.clone()));
     Ok(v)
 }
 
@@ -1713,9 +1811,40 @@ fn external_body(
     let mut blocks = system_blocks(paths).map_err(|e| (503, e))?;
     match caller {
         Some(Value::String(s)) if !s.trim().is_empty() => {
-            blocks.push(json!({ "type": "text", "text": s }))
+            if !crate::prompt::is_canonical_identity(&s) {
+                blocks.push(json!({ "type": "text", "text": s }))
+            }
         }
-        Some(Value::Array(a)) => blocks.extend(a.into_iter()),
+        // 上游硬上限是 system **最多 3 块**（实测：4 块必 405/3012，与体量和内容都无关）。
+        // 我们固定占 2 块，所以调用方的多块 system 必须并成 1 块 —— 只拼接，原文不动，
+        // 客户端自己的提示词与工具链因此完整保留。
+        Some(Value::Array(a)) => {
+            let mut parts: Vec<String> = Vec::new();
+            let mut wants_cache = false;
+            for b in a {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    if t.trim().is_empty() || crate::prompt::is_canonical_identity(t) {
+                        continue;
+                    }
+                    if b.get("cache_control")
+                        .and_then(|c| c.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("ephemeral")
+                    {
+                        wants_cache = true;
+                    }
+                    parts.push(t.to_string());
+                }
+            }
+            if !parts.is_empty() {
+                let merged = parts.join("\n\n");
+                blocks.push(if wants_cache {
+                    json!({ "type": "text", "text": merged, "cache_control": { "type": "ephemeral" } })
+                } else {
+                    json!({ "type": "text", "text": merged })
+                });
+            }
+        }
         _ => {}
     }
     obj.insert("system".into(), Value::Array(blocks));
@@ -1748,6 +1877,29 @@ fn handle_external(
                                 "message": "对外接口没开 —— 到工具的「反代」页打开它" } }),
         );
     }
+
+    // 熔断期：一个请求都不往上游发。撞得越勤，边缘拦得越久（实测 405 三分钟内累计 2870 发）。
+    let (edge_left, edge_first) = {
+        let mut g = gw.inner.lock().unwrap();
+        let left = g.edge_until.saturating_sub(now_ms());
+        let first = left > 0 && !g.edge_warned;
+        g.edge_warned |= first;
+        (left, first)
+    };
+    if edge_left > 0 {
+        let secs = edge_left.div_euclid(1000).max(1);
+        if edge_first {
+            crate::flowlog::log("relay", "edge-wait", &format!("上游通道在熔断中，还剩 {secs}s —— 期间进来的请求直接挡回，不出站"));
+        }
+        return reply_json(
+            slot.take().unwrap(),
+            503,
+            &json!({ "type": "error",
+                     "error": { "type": "overloaded_error",
+                                "message": format!("上游这条通道正被边缘拦截（HTTP 405），已熔断冷却，约 {secs}s 后重新放行；期间不再出站") } }),
+        );
+    }
+
     let mut model = body_model(body).unwrap_or_else(|| EXTERNAL_MODELS[0].to_string());
 
     let client_model = model.clone();
@@ -1906,19 +2058,53 @@ fn handle_external(
                 continue;
             }
         };
-        if SWITCH_STATUS.contains(&status) {
-            if status == 429 {
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
+        // ── 只有 2xx 才允许把上游应答交给调用方，其余一律本地回错。
+        //    被拦时上游发的是整页 HTML，原样透传就成了客户端看到的「HTTP 405 <!doctypehtml>…」。
+        //    更要紧的是分两类：**与号有关**的才换下一个试；**与号无关**的（路由被关、被边缘拦、
+        //    上游自己挂了）换号只是把同一堵墙再撞一遍 —— 实测 405 三分钟内累计 2870 发。
+        if !(200..300).contains(&status) {
+            if SWITCH_STATUS.contains(&status) {
+                if status == 429 {
+                    gw.mark_blocked(&c.id, RATE_TTL_MS);
+                }
+                let d = backoff_ms(tried);
+                crate::flowlog::log(
+                    "relay",
+                    "switch",
+                    &format!("外部 {} HTTP {status} → 冷却/换下一个（退避 {d}ms）", c.name),
+                );
+                std::thread::sleep(Duration::from_millis(d));
+                continue;
             }
-            let d = backoff_ms(tried);
+
+            // 以下都与号无关：不再试别的号。先取一小段应答留作线索（限 600B，读不动就空着）。
+            let mut snip: Vec<u8> = Vec::new();
+            let _ = reader.take(600).read_to_end(&mut snip);
+            let snip = crate::quota::body_snippet(&String::from_utf8_lossy(&snip));
+            let (kind, ms) = upstream_verdict(status, &snip);
+            if ms > 0 {
+                gw.edge_trip(ms);
+            }
+            let verdict = if ms > 0 {
+                format!("熔断 {}s，期间不出站", ms / 1000)
+            } else {
+                "不重试、不换号，直接回错".to_string()
+            };
             crate::flowlog::log(
                 "relay",
-                "switch",
-                &format!("外部 {} HTTP {status} → 冷却/换下一个（退避 {d}ms）", c.name),
+                "edge-block",
+                &format!("外部 {} HTTP {status}｜{kind}｜{verdict}｜片段：{snip}", c.name),
             );
-            std::thread::sleep(Duration::from_millis(d));
-            continue;
+            crate::usage::append(&usage_path, &mk(&c.name, 503, "upstream-block", tried, false, tried_at));
+            return reply_json(
+                slot.take().unwrap(),
+                503,
+                &json!({ "type": "error",
+                         "error": { "type": "overloaded_error",
+                                    "message": format!("上游回 HTTP {status}：{kind} —— {verdict}。应答片段：{snip}") } }),
+            );
         }
+        // 到这里 status 必定是 2xx。
 
         let stream = ctype.as_deref().unwrap_or("").to_ascii_lowercase().contains("event-stream");
         let mut up: Option<String> = None;
@@ -1928,9 +2114,10 @@ fn handle_external(
             let mut head: Vec<u8> = Vec::new();
             let mut buf = vec![0u8; 2048];
             let mut ended = false;
+            let mut eof = false;
             for _ in 0..6 {
                 match reader.read(&mut buf) {
-                    Ok(0) => { ended = true; break; }
+                    Ok(0) => { eof = true; ended = true; break; }
                     Ok(n) => head.extend_from_slice(&buf[..n]),
                     Err(_) => { ended = true; break; }
                 }
@@ -1938,6 +2125,35 @@ fn handle_external(
             }
 
             up = peek_model(&head);
+            let flat = String::from_utf8_lossy(&head)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            // 兜底：上游（或它前面的 CDN/边缘）也可能用 **200** 塞回一页 HTML 或一个空 body。
+            // 那形状跟号无关，换下一个照样拿回同一页 —— 判成通道被拦，不透传也不换号。
+            // 认 HTML 开头 / 首读即 EOF，别拿「认不出模型名」当依据：真流的前几行是
+            // `event:` / `data:`，误判会把整池锁 60 秒。
+            if up.is_none() && (flat.starts_with('<') || (eof && head.is_empty())) {
+                gw.edge_trip(EDGE_COOLDOWN_MS);
+                crate::flowlog::log(
+                    "relay",
+                    "edge-block",
+                    &format!(
+                        "外部 {} HTTP {status} 2xx 但应答不是模型流｜通道被拦（与号无关，换号无意义）｜熔断 {}s，期间不出站｜片段：{}",
+                        c.name,
+                        EDGE_COOLDOWN_MS / 1000,
+                        crate::quota::body_snippet(&flat)
+                    ),
+                );
+                crate::usage::append(&usage_path, &mk(&c.name, 503, "upstream-block", tried, false, tried_at));
+                return reply_json(
+                    slot.take().unwrap(),
+                    503,
+                    &json!({ "type": "error",
+                             "error": { "type": "overloaded_error",
+                                        "message": format!("上游回 HTTP {status} 但应答不是模型流（多半是被边缘拦下的页面），已熔断 {}s", EDGE_COOLDOWN_MS / 1000) } }),
+                );
+            }
             let txt = String::from_utf8_lossy(&head).to_lowercase();
             if up.is_none()
                 && (ended || !ct_lower.contains("event-stream")
@@ -2757,6 +2973,16 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         _ => {}
     }
 
+    // 上游没有 count_tokens（实测原样转发拿回 Go 的裸文本 `404 page not found`，
+    // 不是 Anthropic 形状的 JSON），客户端做上下文预算时会整轮失败。本地估一个。
+    if path.ends_with("/count_tokens") {
+        return reply_json(
+            req,
+            200,
+            &json!({ "input_tokens": estimate_input_tokens(&body) }),
+        );
+    }
+
     if path.starts_with("/v1") {
         return handle_external(req, gw, &paths, &path, &body, &key_tag);
     }
@@ -2766,4 +2992,55 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             .with_status_code(404),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HTML: &str = "<!doctypehtml><html lang=\"zh-cn\"><title>405</title>";
+    const JSON: &str = "{\"code\":3012,\"message\":\"unusual activity\"}";
+
+    #[test]
+    fn blocked_path_trips_the_long_cooldown() {
+        // 实测的那一发：边缘拦下的 405 + 整页 HTML
+        assert_eq!(upstream_verdict(405, HTML).1, EDGE_COOLDOWN_MS);
+        // 没列进 PATH_STATUS、但形状同样是「被拦下的一页 HTML」
+        assert_eq!(upstream_verdict(418, HTML).1, EDGE_COOLDOWN_MS);
+    }
+
+    #[test]
+    fn listed_route_level_codes_trip_even_with_a_json_body() {
+        for code in [404u16, 405, 406, 410, 413, 415, 451, 501, 505] {
+            assert_eq!(upstream_verdict(code, JSON).1, EDGE_COOLDOWN_MS, "{code}");
+        }
+    }
+
+    #[test]
+    fn upstream_failure_gets_the_short_cooldown() {
+        assert_eq!(upstream_verdict(502, JSON).1, UPSTREAM_COOLDOWN_MS);
+        assert_eq!(upstream_verdict(503, HTML).1, UPSTREAM_COOLDOWN_MS);
+    }
+
+    #[test]
+    fn a_bad_request_from_one_client_must_not_freeze_the_pool() {
+        // 没见过的 4xx：多半是这一发请求不对，熔断会把所有号一起锁住
+        assert_eq!(upstream_verdict(400, JSON).1, 0);
+        assert_eq!(upstream_verdict(422, HTML).1, EDGE_COOLDOWN_MS); // 但 HTML 仍按被拦处理
+    }
+
+    #[test]
+    fn odd_statuses_are_rejected_without_retry_or_trip() {
+        assert_eq!(upstream_verdict(302, JSON).1, 0);
+        assert_eq!(upstream_verdict(200, JSON).1, 0); // 2xx 走不到这里，兜底也要给 0
+        assert_eq!(upstream_verdict(100, "").1, 0);
+    }
+
+    #[test]
+    fn account_level_codes_stay_out_of_the_block_table() {
+        // 401/402/403/429 归 SWITCH_STATUS（换号），绝不该同时出现在通道级表里
+        for code in SWITCH_STATUS {
+            assert!(!PATH_STATUS.contains(&code), "{code}");
+        }
+    }
 }

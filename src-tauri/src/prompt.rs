@@ -17,28 +17,80 @@ const PROMPT_PREFIX: &str = "You are ZCode, an interactive coding agent";
 /// 伪造的环境信息塞进每一次请求里 —— 对第三方客户端全是噪音。
 const IDENTITY_PREFIX: &str = "You are an interactive ZCode agent";
 
+/// 调用方自己带来的 system 是否已经是官方那两块。
+///
+/// 上游按身份段在 `system` 里的**出现次数**判 prompt 篡改：同一份身份段再出现一次，
+/// 就回 405 `{"code":3012,...unusual activity}`（实测见 gateway 的 external_body）。
+/// 调用方若就是 ZCode 客户端本身，它的 system 开头已经是这两块，反代再前置一份就成两份。
+pub fn is_canonical_identity(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with(PROMPT_PREFIX) || t.starts_with(IDENTITY_PREFIX)
+}
+
 const OVERRIDE_NAME: &str = "system_prompt.json";
+
+/// 缓存的失效依据：从哪个 `zcode.cjs` 抽的就记哪个，换路径后旧的必须作废。
+///
+/// 按 settings.json 的文件指纹（mtime+len）缓存：界面保存和外部手改都能覆盖，
+/// 没变动时每请求退化成一次 stat，不再读文件解析 + 逐个探测候选路径。
+pub fn cache_key(paths: &Paths) -> String {
+    static K: std::sync::Mutex<
+        Option<((Option<std::time::SystemTime>, Option<u64>), String)>,
+    > = std::sync::Mutex::new(None);
+    let md = fs::metadata(paths.settings_file()).ok();
+    let stamp = (
+        md.as_ref().and_then(|m| m.modified().ok()),
+        md.as_ref().map(|m| m.len()),
+    );
+    let mut g = K.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((s, k)) = g.as_ref() {
+        if *s == stamp {
+            return k.clone();
+        }
+    }
+    let k = find_zcode_cjs(paths)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    *g = Some((stamp, k.clone()));
+    k
+}
 
 pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
     let override_path = paths.store_dir().join(OVERRIDE_NAME);
+    let key = cache_key(paths);
 
     if let Ok(bytes) = fs::read(&override_path) {
-        match serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-        {
-            Some(b) => match validate(&b) {
-                Ok(()) => return Ok(b),
+        match serde_json::from_slice::<Value>(&bytes) {
+            // 数组形态 = 手工放的覆盖文件，不带来源、原样尊重
+            Ok(v) if v.is_array() => match validate(&v.as_array().cloned().unwrap()) {
+                Ok(()) => return Ok(v.as_array().cloned().unwrap()),
                 Err(e) => eprintln!("[prompt] 覆盖文件不合规（{e}），改从 ZCode 抽取"),
             },
-            None => eprintln!("[prompt] 覆盖文件不是合法 JSON 数组，改从 ZCode 抽取"),
+            // 对象形态 = 本程序写的缓存，来源不符就重抽
+            Ok(v) => {
+                let from = v.get("source").and_then(Value::as_str).unwrap_or("");
+                if from != key {
+                    eprintln!("[prompt] 缓存来自另一个 ZCode（{from}），重新抽取");
+                } else {
+                    match v.get("blocks").and_then(Value::as_array).cloned() {
+                        Some(b) => match validate(&b) {
+                            Ok(()) => return Ok(b),
+                            Err(e) => eprintln!("[prompt] 缓存不合规（{e}），改从 ZCode 抽取"),
+                        },
+                        None => eprintln!("[prompt] 缓存缺 blocks，改从 ZCode 抽取"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("[prompt] 覆盖文件不是合法 JSON（{e}），改从 ZCode 抽取"),
         }
     }
 
     match extract_from_zcode(paths) {
         Ok(b) => {
-
-            if let Ok(s) = serde_json::to_string(&Value::Array(b.clone())) {
+            if let Ok(s) = serde_json::to_string(&json!({
+                "source": key,
+                "blocks": Value::Array(b.clone()),
+            })) {
                 let _ = cache_write(&override_path, &s);
             }
             Ok(b)
