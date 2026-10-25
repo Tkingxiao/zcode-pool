@@ -100,6 +100,38 @@ fn client_headers() -> Vec<(&'static str, String)> {
         .collect()
 }
 
+/// 反代出站用的 agent：带上 `relay_proxy`，代理配置坏了就退回直连并记一行。
+/// `read_secs` 是读超时 —— 真实转发要容忍长回答（600s），对话测试不该等人十分钟。
+fn relay_agent(proxy_url: Option<&str>, read_secs: u64) -> ureq::Agent {
+    let mut ab = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(read_secs));
+    if let Some(u) = proxy_url {
+        match ureq::Proxy::new(u) {
+            Ok(px) => ab = ab.proxy(px),
+            Err(e) => crate::flowlog::log("relay", "proxy-bad", &format!("{u}：{e} —— 这一发按直连走")),
+        }
+    }
+    ab.build()
+}
+
+/// 出站请求的头。真实转发与「对话测试」**共用这一个函数**：少任何一个头，上游都可能
+/// 把请求判成异常（实测身份段/头不齐回 405 `{"code":3012}`），那测出来的结论就不作数。
+fn set_relay_headers(req: ureq::Request, token: &str) -> ureq::Request {
+    let mut r = req;
+    for (k, v) in client_headers() {
+        r = r.set(k, &v);
+    }
+    r.set("authorization", &format!("Bearer {}", token))
+        .set("x-api-key", token)
+        // 注：以前这里还有 x-aliyun-captcha-verify-param / -region 两个头，
+        // 2026-09-30 起不再发（上游已关闭模型请求的验证码校验，见 handle_external 里的说明）。
+        .set("x-query-id", &uuid::Uuid::now_v7().to_string())
+        .set("x-request-id", &uuid::Uuid::new_v4().to_string())
+        .set("x-session-id", &uuid::Uuid::new_v4().to_string())
+        .set("x-zcode-trace-id", &uuid::Uuid::new_v4().to_string())
+}
+
 const METER_WINDOW_MS: u64 = 15_000;
 
 const PROBE_EVERY_MS: u64 = 90_000;
@@ -2141,6 +2173,155 @@ fn external_body(
 
 /// 选号：按 policy 排好、再把本会话上次用的号挪到队首；该模型全库无额度时回退到另一个模型。
 /// 刷完额度要能原样重跑一遍，所以把这段从 `handle_external` 里摘出来。
+/// 从应答里捞出模型说的话。优先非流式 JSON 的 `content[].text`；
+/// 拿回的是 SSE 或半截 JSON 就退而求其次扫第一段 `"text":"…"`。
+/// 返回 `None` 表示「没收到回复」—— 这正是对话测试要告诉用户的事。
+fn extract_reply_text(s: &str) -> Option<String> {
+    const CAP: usize = 160;
+    if let Ok(v) = serde_json::from_str::<Value>(s) {
+        if let Some(t) = v
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|a| a.iter().find_map(|b| b.get("text").and_then(Value::as_str)))
+        {
+            if !t.trim().is_empty() {
+                return Some(t.chars().take(CAP).collect());
+            }
+        }
+    }
+    let i = s.find("\"text\"")?;
+    let rest = &s[i + "\"text\"".len()..];
+    let j = rest.find(':')?;
+    let mut it = rest[j + 1..].chars().skip_while(|c| c.is_whitespace());
+    if it.next() != Some('"') {
+        return None;
+    }
+    let mut out = String::new();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            if let Some(n) = it.next() {
+                out.push(n);
+            }
+            continue;
+        }
+        if c == '"' {
+            break;
+        }
+        out.push(c);
+        if out.chars().count() >= CAP {
+            break;
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 对话测试试哪一档：额度缓存里有余额的先试，都没余额或没缓存就用对外默认档。
+fn test_model(gw: &Gateway, id: &str) -> String {
+    let g = gw.inner.lock().unwrap();
+    if let Some((_, ov)) = g.quota.get(id) {
+        for m in EXTERNAL_MODELS {
+            if ov.plans
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .any(|it| model_same(&it.name, m) && it.remaining.unwrap_or(0.0) > 0.0)
+            {
+                return m.to_string();
+            }
+        }
+    }
+    EXTERNAL_MODELS[0].to_string()
+}
+
+/// 「对话测试」：向指定号真发一发最小 messages，看能不能拿到回复。
+///
+/// 走的是和生产**完全一样**的出站路径（`external_body` 改写 + `set_relay_headers` +
+/// `relay_agent`）—— 少一样，测出来的结论就不代表真实请求。
+///
+/// ⚠ 这会**真烧掉一点点额度**（一发 hi、max_tokens 给得很小），所以按钮旁边写明白。
+/// ⚠ 只读：不冷却这个号、也不熔断通道。手点一下失败就把号池冻住是帮倒忙；
+/// 失败原因直接借 `upstream_verdict` 报出来，附上「真跑的话会被冷却多久」。
+fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
+    let name = store::list_accounts(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| a.id == id)
+        .map(|a| a.name)
+        .unwrap_or_else(|| id.to_string());
+    let fail = |j: Value| -> Value {
+        let mut o = j.as_object().cloned().unwrap_or_default();
+        o.insert("ok".to_string(), json!(false));
+        o.insert("name".to_string(), json!(name));
+        Value::Object(o)
+    };
+
+    let acc = match store::load_account(paths, id) {
+        Ok(a) => a,
+        Err(e) => return fail(json!({ "error": format!("读不到这个号：{e}") })),
+    };
+    let secret = crate::zcrypto::default_secret(&paths.home);
+    let Some(token) = crate::quota::candidate_tokens(&acc.credentials, acc.config.as_ref(), &secret)
+        .into_iter()
+        .next()
+    else {
+        return fail(json!({ "error": "这个号没有可用凭证 —— 先重新登录一次" }));
+    };
+    let mid = acc.virtual_device_mid.clone().unwrap_or_default();
+    let model = test_model(gw, id);
+    let sess = account_session(id, &day_seed());
+    let plain = json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "hi" }],
+    })
+    .to_string();
+    let out_body = match external_body(plain.as_bytes(), &mid, &model, &sess, paths) {
+        Ok(b) => b,
+        Err((_, e)) => return fail(json!({ "model": model, "error": format!("组装请求失败：{e}") })),
+    };
+
+    let proxy = gw.inner.lock().unwrap().relay_proxy.clone();
+    let t0 = now_ms();
+    let sent = set_relay_headers(relay_agent(proxy.as_deref(), 45).request("POST", &format!("{UPSTREAM}/v1/messages")), &token)
+        .send_bytes(&out_body);
+    let ms = now_ms().saturating_sub(t0);
+    let mut out = match sent {
+        Ok(r) => {
+            let status = r.status();
+            let mut buf = String::new();
+            let _ = r.into_reader().take(8192).read_to_string(&mut buf);
+            match extract_reply_text(&buf) {
+                Some(t) => json!({ "ok": true, "status": status, "ms": ms, "reply": t }),
+                None => json!({
+                    "ok": false, "status": status, "ms": ms,
+                    "error": format!("HTTP {status} 但应答里没有模型内容"),
+                    "snippet": crate::quota::body_snippet(&buf)
+                }),
+            }
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let mut buf = String::new();
+            let _ = r.into_reader().take(600).read_to_string(&mut buf);
+            let snip = crate::quota::body_snippet(&buf);
+            let (kind, cool) = upstream_verdict(code, &snip);
+            json!({
+                "ok": false, "status": code, "ms": ms, "kind": kind, "snippet": snip,
+                "would_cooldown_s": cool / 1000
+            })
+        }
+        Err(e) => json!({ "ok": false, "ms": ms, "error": e.to_string() }),
+    };
+    if let Some(o) = out.as_object_mut() {
+        o.insert("name".to_string(), json!(name));
+        o.insert("model".to_string(), json!(model));
+    }
+    crate::flowlog::log("relay", "chat-test", &format!("{}", out));
+    out
+}
+
 fn pick_accounts(gw: &Gateway, paths: &Paths, model: &mut String, skey: &str, mmode: &str) -> Vec<Candidate> {
     let mut list = gw.sticky_order(gw.candidates(paths, model), skey);
     if list.is_empty() && mmode == MODEL_AUTO {
@@ -2245,16 +2426,7 @@ fn handle_external(
     };
     let target = format!("{UPSTREAM}{path}");
     let proxy_url = gw.inner.lock().unwrap().relay_proxy.clone();
-    let mut ab = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(600));
-    if let Some(u) = proxy_url.as_deref() {
-        match ureq::Proxy::new(u) {
-            Ok(px) => ab = ab.proxy(px),
-            Err(e) => crate::flowlog::log("relay", "proxy-bad", &format!("{u}：{e} —— 这一发按直连走")),
-        }
-    }
-    let agent = ab.build();
+    let agent = relay_agent(proxy_url.as_deref(), 600);
 
     // 会话指纹：同一场对话钉同一个号，不同对话/不同 Key 分摊到不同号。
     let skey = session_key(body, key_tag);
@@ -2334,19 +2506,11 @@ fn handle_external(
             }
         };
 
-        let mut call = agent.request("POST", &target);
-        for (k, v) in client_headers() {
-            call = call.set(k, &v);
-        }
-        call = call
-            .set("authorization", &format!("Bearer {}", c.token))
-            .set("x-api-key", &c.token)
-            // 注：以前这里还有 x-aliyun-captcha-verify-param / -region 两个头，
-            // 2026-09-30 起不再发（上游已关闭模型请求的验证码校验，见上方说明）。
-            .set("x-query-id", &uuid::Uuid::now_v7().to_string())
-            .set("x-request-id", &uuid::Uuid::new_v4().to_string())
-            .set("x-session-id", &uuid::Uuid::new_v4().to_string())
-            .set("x-zcode-trace-id", &uuid::Uuid::new_v4().to_string());
+        // 头与真实转发共用 `set_relay_headers`：少一个头上游就可能判成异常请求，
+        // 那样「对话测试」得出的结论不代表真实请求。
+        let call = set_relay_headers(agent.request("POST", &target), &c.token);
+        // 注：以前这里还有 x-aliyun-captcha-verify-param / -region 两个头，
+        // 2026-09-30 起不再发（上游已关闭模型请求的验证码校验，见上方说明）。
 
         let tried_at = now_ms();
         last_acct = c.name.clone();
@@ -2754,6 +2918,15 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             }
             return reply_json(req, 200, &json!({ "results": res, "status": gw.console_status(&paths) }));
         }
+        "/proxy/chat-test" => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.is_empty() {
+                return reply_json(req, 400, &json!({ "error": "缺 id" }));
+            }
+            return reply_json(req, 200, &chat_test(gw, &paths, id));
+        }
+
         "/proxy/bind" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let bind = v.get("bind").and_then(|x| x.as_str()).unwrap_or("");
@@ -3489,6 +3662,37 @@ mod tests {
         assert_eq!(pick_for_new_session(&list, &used(&["A"])), 1, "A 被占了就给 B，别继续挤 A");
         assert_eq!(pick_for_new_session(&list, &used(&["A", "B"])), 2);
         assert_eq!(pick_for_new_session(&list, &used(&["A", "B", "C"])), 0, "全被占用就回队首：共用好过把请求判成空池");
+    }
+
+    #[test]
+    fn reply_text_prefers_the_json_content_block() {
+        let j = r#"{"id":"x","model":"GLM-5.3","content":[{"type":"text","text":"你好，我在"}]}"#;
+        assert_eq!(extract_reply_text(j).as_deref(), Some("你好，我在"));
+        // 转义要还原，不然引号后面就断了
+        let q = r#"{"content":[{"type":"text","text":"他说\"好\"完"}]}"#;
+        assert_eq!(extract_reply_text(q).as_deref(), Some("他说\"好\"完"));
+    }
+
+    #[test]
+    fn reply_text_falls_back_to_scanning_an_sse_body() {
+        let sse = "event: content_block_start\ndata: {\"type\":\"text\",\"text\":\"流式答复\"}\n\n";
+        assert_eq!(extract_reply_text(sse).as_deref(), Some("流式答复"));
+    }
+
+    #[test]
+    fn reply_text_reports_none_when_the_model_said_nothing() {
+        assert_eq!(extract_reply_text("<!doctype html><html><body>blocked</body></html>"), None, "拦截页不是回复");
+        assert_eq!(extract_reply_text(""), None);
+        assert_eq!(extract_reply_text(r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#), None);
+        assert_eq!(extract_reply_text(r#"{"content":[{"type":"text","text":"   "}]}"#), None, "空白不算答复");
+        assert_eq!(extract_reply_text(r#"{"content":[]}"#), None);
+    }
+
+    #[test]
+    fn reply_text_is_capped_for_display() {
+        let long = format!(r#"{{"content":[{{"type":"text","text":"{}"}}]}}"#, "字".repeat(400));
+        let t = extract_reply_text(&long).unwrap();
+        assert_eq!(t.chars().count(), 160, "行内标签只放得下一小段");
     }
 
     #[test]

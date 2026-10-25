@@ -838,7 +838,7 @@ function viewChan() {
       '<td class="mono" data-p="c-last" style="color:var(--dim2)">' + (h.lastAt ? hhmmss(h.lastAt) : "—") + "</td>" +
       '<td style="text-align:right;white-space:nowrap">' +
         '<button class="mini" data-probe="' + esc(c.id) + '">' + ICON("play", 14) + "探测</button>" +
-        (c.frozen ? ' <button class="mini" data-unfreeze="' + esc(c.id) + '">' + ICON("power", 14) + "解冻</button>" : "") +
+        acctChatBtns(c) +
       "</td></tr>";
   }).join("");
   return '<div data-p="poolLat">' + poolLatHtml() + "</div>" + '<div class="panel">' +
@@ -854,7 +854,54 @@ function viewChan() {
           : emptyState("inbox", "号池是空的 —— 先去「账号库」加号")) +
     '<div class="foot-note">探测走的是<b>额度接口</b>（免费、不用验证码），不真发模型请求 —— 那会烧号的额度。' +
     "「解冻」清掉本地的「冷却」标记（那是<b>号级</b>的：429 冷却 5 分钟，401/402/403 一分钟），上游恢复了就不用干等；" +
-    "<b>通道级</b>熔断要整个上游通道都不通时才触发，在「接入」卡片里手动放行。</div></div>";
+    "<b>通道级</b>熔断要整个上游通道都不通时才触发，在「接入」卡片里手动放行。" +
+    "「对话测试」<b>真发一发</b> <span class=\"mono\">hi</span> 给模型（<span class=\"mono\">max_tokens</span> 很小，几乎不花额度），" +
+    "用来确认这个号此刻到底能不能出话；它只报结果，不会因此冷却号或熔断通道。</div></div>";
+}
+
+// 对话测试的结果按号驻留在这里：控制台每轮 status 都会重渲染整张表，
+// 只把结果写进按钮文字会被抹掉，所以必须存在变量里、跟着模板一起出。
+const chatResults = {};
+
+// 服务端应答 → 行内那枚标签。后端不返回 `error` 字段（那是 post() 的告警通道），
+// 也不让这里的返回值污染全局 S，所以走 chatTest() 自己发的 fetch。
+function chatResultView(d, httpOk) {
+  const ms = d.ms == null ? "" : (d.ms >= 1000 ? " · " + (d.ms / 1000).toFixed(1) + "s" : " · " + d.ms + "ms");
+  if (d.ok) return { cls: "ok", text: "收到回复" + ms, title: "「" + (d.reply || "") + "」" };
+  if (d.status) {
+    // 标签只留结论：定性与「真跑会被冷却多久」都放 title，行内放不下（实测 439px 宽，
+    // 四分之一张表就是一枚标签）。
+    const cd = d.would_cooldown_s ? "真跑会被冷却 " + d.would_cooldown_s + "s" : "";
+    const tip = [d.kind, cd, d.error, d.snippet].filter(Boolean).join("\n");
+    return { cls: "bad", text: "无回复 HTTP " + d.status + ms, title: tip };
+  }
+  return { cls: "bad", text: httpOk ? "没拿到应答" : "网关报错", title: d.error || d.detail || "未知" };
+}
+
+function acctChatBtns(c) {
+  let out = c.frozen
+    ? ' <button class="mini" data-unfreeze="' + esc(c.id) + '">' + ICON("power", 14) + "解冻</button>"
+    : "";
+  out += ' <button class="mini" data-chattest="' + esc(c.id) + '">' + ICON("mail", 14) + "对话测试</button>";
+  const r = chatResults[c.id];
+  if (r) out += ' <span class="tag ' + r.cls + '" title="' + esc(r.title) + '">' + esc(r.text) + "</span>";
+  return out;
+}
+
+async function chatTest(id, btn) {
+  btn.disabled = true;
+  btn.textContent = "测试中…";
+  let view;
+  try {
+    const r = await fetch("/proxy/chat-test", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }),
+    });
+    view = chatResultView(await r.json(), r.ok);
+  } catch (e) {
+    view = { cls: "bad", text: "请求失败", title: String((e && e.message) || e) };
+  }
+  chatResults[id] = view;
+  render();
 }
 
 function patchChan() {
@@ -2301,7 +2348,7 @@ function viewAdmin() {
       '<td class="mono" style="color:var(--dim2)">' + (hh.lastAt ? hhmmss(hh.lastAt) : "—") + "</td>" +
       '<td style="text-align:right;white-space:nowrap">' +
         '<button class="mini" data-probe="' + esc(c.id) + '">' + ICON("play", 14) + "探测</button>" +
-        (c.frozen ? ' <button class="mini" data-unfreeze="' + esc(c.id) + '">' + ICON("power", 14) + "解冻</button>" : "") +
+        acctChatBtns(c) +
       "</td></tr>";
   }).join("");
   return `
@@ -2415,6 +2462,9 @@ function render() {
   }
   for (const b of document.querySelectorAll("[data-unfreeze]")) {
     b.onclick = () => post("/proxy/unfreeze", { id: b.dataset.unfreeze });
+  }
+  for (const b of document.querySelectorAll("[data-chattest]")) {
+    b.onclick = () => chatTest(b.dataset.chattest, b);
   }
   const eb = document.querySelector("[data-unfreeze-edge]");
   if (eb) eb.onclick = () => { eb.disabled = true; post("/proxy/unfreeze", { edge: true }); };
