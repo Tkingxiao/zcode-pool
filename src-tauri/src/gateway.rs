@@ -53,11 +53,30 @@ const REFRESH_MIN_GAP_MS: u64 = 15_000;
 const EMPTY_WAIT_MS: u64 = 2_000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
-const RATE_TTL_MS: u64 = 5 * 60 * 1000;
+/// 冷却时长的阶梯。以前是「429 一律 5 分钟、401/402/403 一律 60 秒」，一次抖动就把号锁掉 ——
+/// 面板上看到的就是「冻了，手点解冻马上又能用」。现在按**同一个号连续挨打**的次数递增：
+/// 30s → 60s → 120s → 封顶 5 分钟；中间只要有一发成功，计数清零、下次回到 30s。
+const FIRST_COOLDOWN_MS: u64 = 30_000;
+const MAX_COOLDOWN_MS: u64 = 5 * 60 * 1000;
 
-/// 401/402/403 的冷却比限流短：号只有一个的时候，5 分钟冻结等于把整个池子判死；
-/// 一分钟足够让它自己回到候选里，真死掉的凭证也会反复冷却、不会每发都试。
-const AUTH_COOLDOWN_MS: u64 = 60_000;
+/// 隔得够久的两次失败不算「连续」，计数从头来（免得过一晚就永久升级成 5 分钟）。
+const STRIKE_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// 传输层失败（连不上 / 被本地协议栈中止 / 超时）根本没拿到 HTTP 状态，判不了号的好坏。
+/// 实测今天 35 次全是 os error 10053/10054 这类本地中断，下一发同一个号照常通 ——
+/// 以前跟着 429 一起冻 5 分钟，是「冻结太容易」的头号来源。
+const NET_COOLDOWN_MS: u64 = 15_000;
+
+/// 上游业务码 3009 = 这个号的模型并发被占满（例如它正在官方客户端里说话）。松手就没了，
+/// 跟额度无关，所以也只短冷却。
+const CONC_COOLDOWN_MS: u64 = 15_000;
+
+/// 「共享限流」判定窗口：不同号在这么短的时间里都吃 429，那就不是某个号的事，
+/// 是出口/套餐级的限流 —— 一个个撞只会把整池冻死（实测 22:38:47、22:39:02、22:39:28 三连，
+/// 三个号各冻 5 分钟，池子当场空掉，而限流本身早过去了）。
+/// 撞上这个形状就改闸整条通道，期间不出站，**一个号都不冻**。
+const RATE_SHARED_WINDOW_MS: u64 = 90_000;
+const RATE_GATE_MS: u64 = 60_000;
 
 pub const POLICY_EXPIRE: &str = "expire_first";
 pub const POLICY_MOST_LEFT: &str = "most_left";
@@ -310,15 +329,24 @@ struct Inner {
 
     model_map: std::collections::BTreeMap<String, String>,
 
-    /// 号级冷却：账号 id → **解冻时刻**（不是打标时刻）。过期即自动重新入选，
-    /// `unfreeze` 可以手动提前清。
+    /// 号级冷却：账号 id → 冷却状态。到期即自动重新入选，`unfreeze` 可以手动提前清。
     ///
     /// 「额度用尽」以前想另存一张 `(号, 模型档)` 表，但它从来没有写入点 —— 没额度的号
     /// 在 `candidates` 里直接按实时额度筛掉了，那张表已删。
-    blocked: HashMap<String, u64>,
+    blocked: HashMap<String, Freeze>,
+
+    /// 同一个号**连续**挨打几次（`Freeze.until` 只说「冻到什么时候」，说不清该冻多久）。
+    /// 值 = (上次打标时刻, 次数)；成功一发或手动解冻就清 —— 这是「误冻一次不至于越滚越长」的关键。
+    strikes: HashMap<String, (u64, u32)>,
+
+    /// 上一发 429 落在哪个号身上、什么时候。用来认「跨号级联 = 出口级限流」那个形状。
+    last_429: Option<(String, u64)>,
 
     /// 上游通道熔断状态（与号无关，整条通道共用一个）
     edge: Edge,
+
+    /// 上游限流闸门（同上，与号无关）：闸期间不出站，号一个都不冻
+    rate: Edge,
 }
 
 #[derive(Clone, Default)]
@@ -368,6 +396,14 @@ impl Edge {
         self.warned = true;
         Some((left, first))
     }
+}
+
+/// 一次号级冷却。`until` = 解冻时刻（不是打标时刻）；`why` 是给面板看的一句话原因。
+/// 以前状态列只写「冷却」，看不出这究竟是号的错还是本地网络的错，用户只能手点解冻赌一把。
+#[derive(Clone, Copy, Default)]
+struct Freeze {
+    until: u64,
+    why: &'static str,
 }
 
 struct Candidate {
@@ -425,9 +461,11 @@ impl Gateway {
 
         let frozen: serde_json::Map<String, Value> = {
             let mut m = serde_json::Map::new();
-            for (id, t) in g.blocked.iter() {
-                if *t > now {
-                    m.insert(id.clone(), json!("冷却"));
+            for (id, f) in g.blocked.iter() {
+                if f.until > now {
+                    // 带上原因和还剩多久 —— 只写「冷却」的话，用户分不清是号的错还是网络断了，
+                    // 只能靠手点解冻赌一把
+                    m.insert(id.clone(), json!(freeze_tag(f.why, f.until - now)));
                 }
             }
             m
@@ -531,7 +569,7 @@ impl Gateway {
             "lastBilling": g.last_billing,
             "routedQuota": quota_rows_for(&g, route_id.as_deref()),
             "clientQuota": quota_rows_for(&g, client_id.as_deref()),
-            "blocked": g.blocked.values().filter(|t| **t > now_ms()).count(),
+            "blocked": g.blocked.values().filter(|f| f.until > now_ms()).count(),
             "edgeLeft": g.edge.left(now_ms()),
             "policy": g.policy,
             "pinned": g.pinned,
@@ -552,7 +590,8 @@ impl Gateway {
             models_seen(&g.quota)
         };
         for m in ms {
-            if let Some(c) = self.sticky_order(self.candidates(paths, &m), "").into_iter().next() {
+            let cs = self.candidates(paths, &m, &[]);
+            if let Some(c) = self.sticky_order(cs, "").into_iter().next() {
                 return Some(c.id);
             }
         }
@@ -623,12 +662,36 @@ impl Gateway {
         Ok(())
     }
 
-    fn mark_blocked(&self, id: &str, ms: u64) {
+    /// 给这个号记一次「连续挨打」，返回这是第几次（从 1 起）。间隔超过 `STRIKE_WINDOW_MS`
+    /// 就当新的开始 —— 别让很久以前的一次抖动把后来的冷却一路顶到 5 分钟。
+    fn bump_strike(&self, id: &str) -> u32 {
         let mut g = self.inner.lock().unwrap();
         let now = now_ms();
-        g.blocked.retain(|_, t| *t > now);
-        let cur = g.blocked.get(id).copied().unwrap_or(0);
-        g.blocked.insert(id.to_string(), cur.max(now + ms));
+        let n = match g.strikes.get(id) {
+            Some((at, n)) if now.saturating_sub(*at) <= STRIKE_WINDOW_MS => n.saturating_add(1),
+            _ => 1,
+        };
+        g.strikes.insert(id.to_string(), (now, n));
+        n
+    }
+
+    /// 冻这个号 `ms` 毫秒，`why` 是面板上给人看的原因。`ms = 0` 什么都不做（判过但没错）。
+    /// 已经冻得更久的不缩短，只换最新的原因。
+    fn freeze_account(&self, id: &str, ms: u64, why: &'static str) {
+        if ms == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        g.blocked.retain(|_, f| f.until > now);
+        let cur = g.blocked.get(id).copied().unwrap_or_default();
+        g.blocked.insert(
+            id.to_string(),
+            Freeze {
+                until: cur.until.max(now + ms),
+                why,
+            },
+        );
     }
 
     /// 熔断整条上游通道 `ms`：期间 `handle_external` 直接回 503，一个请求都不往上游发。
@@ -639,6 +702,12 @@ impl Gateway {
     /// 手动解除通道熔断（换了出口/网络之后不想干等 TTL）。返回解除时还剩多少毫秒。
     fn edge_reset(&self) -> u64 {
         self.inner.lock().unwrap().edge.reset(now_ms())
+    }
+
+    /// 手动解除限流闸门。和 `edge_reset` 是两层（一个被边缘拦、一个被上游限流），
+    /// 但用户在面板上点的都是同一个「解冻」，所以两个一起清。
+    fn rate_reset(&self) -> u64 {
+        self.inner.lock().unwrap().rate.reset(now_ms())
     }
 
     /// 立刻重取这些号的额度：单号粒度、去重节流、跑在后台线程 —— 不挡请求路径。
@@ -981,10 +1050,25 @@ impl Gateway {
         let before = g.blocked.len();
         g.blocked.remove(id);
         let n = before - g.blocked.len();
+        // 连挨几次的计数也清掉：手点解冻等于人说「这个号我看过，没问题」。留着旧次数，
+        // 下一次抖动就会直接跳到长冷却，又变成「冻得太容易」。
+        g.strikes.remove(id);
         if let Some(h) = g.health.get_mut(id) {
             h.streak = 0;
         }
         n
+    }
+
+    /// 整池都在冷却时，挑一个**最快到期**的号借道（返回 id + 还剩多久）。
+    /// 判错一次不该逼人手点解冻才能继续干活；但也只借这一个，其余号继续凉着。
+    fn soonest_frozen(&self) -> Option<(String, u64)> {
+        let g = self.inner.lock().unwrap();
+        let now = now_ms();
+        g.blocked
+            .iter()
+            .filter(|(_, f)| f.until > now)
+            .min_by_key(|(_, f)| f.until)
+            .map(|(id, f)| (id.clone(), f.until - now))
     }
 
     pub fn set_external(&self, on: bool) {
@@ -1263,7 +1347,9 @@ impl Gateway {
         Ok(n)
     }
 
-    fn candidates(&self, paths: &Paths, model: &str) -> Vec<Candidate> {
+    /// `forgive` 里的 id **无视冷却**也要入选（只用在整池都在凉、必须借道一发的时候，
+    /// 见 `soonest_frozen`）。空数组 = 常规筛选，冷却中的号一律排掉。
+    fn candidates(&self, paths: &Paths, model: &str, forgive: &[String]) -> Vec<Candidate> {
         let accounts = store::list_accounts(paths).unwrap_or_default();
         let secret = crate::zcrypto::default_secret(&paths.home);
         let (policy, pinned) = {
@@ -1279,8 +1365,8 @@ impl Gateway {
 
             {
                 let g = self.inner.lock().unwrap();
-                if let Some(t) = g.blocked.get(&acc.id) {
-                    if *t > now_ms() {
+                if let Some(f) = g.blocked.get(&acc.id) {
+                    if f.until > now_ms() && !forgive.iter().any(|x| x == &acc.id) {
                         continue;
                     }
                 }
@@ -1561,6 +1647,49 @@ fn pick_token_index(tokens: &[String], hint: Option<&str>) -> usize {
     }
 }
 
+/// 同一个号连续挨打到第 `n` 次该冷却多久：30s、60s、120s…… 封顶 5 分钟。
+/// 一次抖动就冻满 5 分钟是旧版最招骂的地方 —— 手点解冻马上能用，说明那一发根本不是号的错。
+fn escalating_cooldown(n: u32) -> u64 {
+    let shift = n.saturating_sub(1).min(4) as u32;
+    FIRST_COOLDOWN_MS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_COOLDOWN_MS)
+}
+
+/// 这一发该不该把这个号冻起来、冻多久。`code` 是从应答体里认出来的上游业务码。
+/// 返回 0 = 不冻（跟号无关，交给通道闸门/熔断去处理）。
+fn account_cooldown(status: u16, code: i64, strikes: u32) -> u64 {
+    match status {
+        // 3009 = 这个号的并发被占满（正在官方客户端里说话之类），松手就没 —— 短冷却就够
+        429 if code == 3009 => CONC_COOLDOWN_MS,
+        401 | 402 | 403 | 429 => escalating_cooldown(strikes),
+        _ => 0,
+    }
+}
+
+/// 面板状态列上的一句话原因。
+fn freeze_label(status: u16, code: i64) -> &'static str {
+    match status {
+        429 if code == 3009 => "并发占用",
+        401 => "凭证被拒",
+        402 => "额度不足",
+        403 => "访问被拒",
+        429 => "上游限流",
+        _ => "冷却",
+    }
+}
+
+/// 这发 429 是不是「出口/套餐级限流」的形状：**别的号**在窗口内也刚挨了一发（且不是并发占用）。
+/// 是的话就该闸整条通道，而不是把号一个个冻过去 —— 实测三连 429 会把 4 个号的池子当场冻空。
+fn is_shared_rate_limit(prev: Option<(&str, u64)>, acct: &str, now: u64) -> bool {
+    match prev {
+        Some((last_acct, last_at)) => {
+            last_acct != acct && now.saturating_sub(last_at) <= RATE_SHARED_WINDOW_MS
+        }
+        None => false,
+    }
+}
+
 /// 凭证被上游接受了、但这一发没出话 —— 按状态码给个准确说法。
 /// 关键是别把它写成"凭证失效"：那会让人去重新登录，而真正的原因往往是并发超限或上游抖动。
 fn probe_gap_label(status: u16) -> String {
@@ -1573,10 +1702,15 @@ fn probe_gap_label(status: u16) -> String {
     }
 }
 
-/// 号级失败的冷却时长。**生产换号和对话测试共用**这一处判断 —— 两边各写一遍迟早会飘，
-/// 而测试里那句「真跑会被冷却多久」报错了就等于在骗人。
-fn account_cooldown(status: u16) -> u64 {
-    if status == 429 { RATE_TTL_MS } else { AUTH_COOLDOWN_MS }
+/// 面板状态列上的冷却标签：原因 + 还剩多久。刻意压短 —— 这一列的格子是 `nowrap` 的，
+/// 写「凭证被拒 · 还剩 297 秒」会把号池表挤变形。
+fn freeze_tag(why: &str, left_ms: u64) -> String {
+    let secs = left_ms.div_euclid(1000).max(1);
+    if secs >= 120 {
+        format!("{why}·{}分", (secs + 59) / 60)
+    } else {
+        format!("{why}·{secs}s")
+    }
 }
 
 /// 非 2xx 且**不是号的问题**时，这条应答怎么定性：`(给人看的标签, 熔断多久)`，0 = 不熔断。
@@ -2569,11 +2703,18 @@ fn chat_test(gw: &Gateway, paths: &Paths, id: &str) -> Value {
     out
 }
 
-fn pick_accounts(gw: &Gateway, paths: &Paths, model: &mut String, skey: &str, mmode: &str) -> Vec<Candidate> {
-    let mut list = gw.sticky_order(gw.candidates(paths, model), skey);
+fn pick_accounts(
+    gw: &Gateway,
+    paths: &Paths,
+    model: &mut String,
+    skey: &str,
+    mmode: &str,
+    forgive: &[String],
+) -> Vec<Candidate> {
+    let mut list = gw.sticky_order(gw.candidates(paths, model, forgive), skey);
     if list.is_empty() && mmode == MODEL_AUTO {
         for alt in EXTERNAL_MODELS.iter().filter(|m| **m != model.as_str()) {
-            let c2 = gw.sticky_order(gw.candidates(paths, alt), skey);
+            let c2 = gw.sticky_order(gw.candidates(paths, alt, forgive), skey);
             if !c2.is_empty() {
                 crate::flowlog::log("relay", "model-fallback", &format!("{model} 全库无额度 → 回退到 {alt}"));
                 *model = alt.to_string();
@@ -2623,6 +2764,28 @@ fn handle_external(
             &json!({ "type": "error",
                      "error": { "type": "overloaded_error",
                                 "message": format!("上游这条通道正被边缘拦截（HTTP 405），已熔断冷却，约 {secs}s 后重新放行；期间不再出站") } }),
+        );
+    }
+
+    // 上游限流闸门。形状是「好几个号在几十秒内都回 429」—— 那限额在出口/套餐那一层，
+    // 不在号上：把号一个个冻起来只会把整池锁死（实测三连 429 之后 4 个号各冻 5 分钟，
+    // 池子当场空掉，而限流本身早过去了）。闸一会儿，号一个都不冻。
+    let rate_waiting = { gw.inner.lock().unwrap().rate.waiting(now_ms()) };
+    if let Some((left, first)) = rate_waiting {
+        let secs = left.div_euclid(1000).max(1);
+        if first {
+            crate::flowlog::log(
+                "relay",
+                "rate-wait",
+                &format!("上游在限流（多个号几十秒内都回 429），还剩 {secs}s —— 期间直接挡回，不出站，号一个都没冻"),
+            );
+        }
+        return reply_json(
+            slot.take().unwrap(),
+            503,
+            &json!({ "type": "error",
+                     "error": { "type": "overloaded_error",
+                                "message": format!("上游在限流（多个号几十秒内都回 HTTP 429），已闸住整条通道，约 {secs}s 后放行。号都没被冻 —— 限额在出口这一层，换号没用") } }),
         );
     }
 
@@ -2679,7 +2842,8 @@ fn handle_external(
     let skey = session_key(body, key_tag);
     // 上一轮攒下的「额度待确认」（扣到 0 / 被拒 / 没缓存）在这里排空，后台刷，不挡这一发。
     gw.drain_quota_dirty(paths);
-    let mut cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode);
+    let mut forgive: Vec<String> = Vec::new();
+    let mut cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode, &forgive);
 
     if cands.is_empty() {
         // 缓存可能只是过期，别据此就判「号池没人可用」：先限时重取一轮全量额度再决定。
@@ -2691,7 +2855,20 @@ fn handle_external(
             .map(|a| a.id)
             .collect();
         if !ids.is_empty() && gw.refresh_accounts(paths, ids, EMPTY_WAIT_MS, "判空前确认") > 0 {
-            cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode);
+            cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode, &forgive);
+        }
+    }
+    if cands.is_empty() {
+        // 全都是被冷却挡掉的？那就借道最快解冻的那个号发一发，别把用户卡在「请手点解冻」。
+        // 冷却本来就是判出来的（判错还会判错第二次），整池锁死时宁可多发这一发。
+        if let Some((id, left)) = gw.soonest_frozen() {
+            crate::flowlog::log(
+                "relay",
+                "freeze-bypass",
+                &format!("没有号可选，借道最快解冻的那个（还剩 {}s）—— 冷却判错时这一发就是自愈", left / 1000),
+            );
+            forgive = vec![id];
+            cands = pick_accounts(&gw, paths, &mut model, &skey, &mmode, &forgive);
         }
     }
     if cands.is_empty() {
@@ -2773,7 +2950,10 @@ fn handle_external(
             }
             Err(e) => {
                 crate::flowlog::log("relay", "external-fail", &format!("{} {e}", c.name));
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
+                // 连 HTTP 状态都没拿到：10053/10054 是本地协议栈把连接掐了，号是无辜的
+                // （今天日志里这种有 35 次，每次冻 5 分钟 = 「冻结太容易」的主要来源）。
+                // 短冷却、不计次 —— 下一发它照常能用，不用人手点解冻。
+                gw.freeze_account(&c.id, NET_COOLDOWN_MS, "网络中断");
                 std::thread::sleep(Duration::from_millis(backoff_ms(tried)));
                 continue;
             }
@@ -2784,26 +2964,88 @@ fn handle_external(
         //    上游自己挂了）换号只是把同一堵墙再撞一遍 —— 实测 405 三分钟内累计 2870 发。
         if !(200..300).contains(&status) {
             if SWITCH_STATUS.contains(&status) {
-                // 四类一律冷却。以前只有 429 冷却，于是 401/402/403 的号既不冻结也不重取
-                // 额度 —— 下一个请求仍从它开始，每一发都白烧一次往返。
-                let cool = account_cooldown(status);
-                gw.mark_blocked(&c.id, cool);
+                // 429 要先认一眼应答体里的业务码。3009 = 这个号的**并发**被占满（例如它正在
+                // 官方客户端里说话），松手就没；当成额度用尽冻 5 分钟纯属误伤。
+                let code = if status == 429 {
+                    let mut snip: Vec<u8> = Vec::new();
+                    let _ = reader.take(600).read_to_end(&mut snip);
+                    peek_code(&snip).parse::<i64>().unwrap_or(0)
+                } else {
+                    0
+                };
+                let now = now_ms();
+                // 上一发 429 落在谁身上（决定这是「这个号的事」还是「出口的事」）
+                let prev_429 = { gw.inner.lock().unwrap().last_429.clone() };
+                let shared = status == 429
+                    && code != 3009
+                    && is_shared_rate_limit(
+                        prev_429.as_ref().map(|(id, at)| (id.as_str(), *at)),
+                        &c.id,
+                        now,
+                    );
+                if status == 429 && code != 3009 {
+                    // 只记「限流形状」的 429。并发占用是号自己此刻忙，拿它当上一发会把
+                    // 「A 正忙 + B 真限流」误判成全网限流。
+                    gw.inner.lock().unwrap().last_429 = Some((c.id.clone(), now));
+                }
+                if shared {
+                    // 判成出口级限流：闸住整条通道，这一发也别再去撞下一个号 —— 出去就是白烧，
+                    // 而且**一个号都不冻**：限额不在号上，冻号只会把好号一起锁死。
+                    gw.inner.lock().unwrap().rate.trip(now, RATE_GATE_MS);
+                    crate::flowlog::log(
+                        "relay",
+                        "rate-gate",
+                        &format!(
+                            "{} 与别的号在 {}s 内都回 429 → 判成出口/套餐级限流：闸住整条通道 {}s，一个号都不冻",
+                            c.name,
+                            RATE_SHARED_WINDOW_MS / 1000,
+                            RATE_GATE_MS / 1000
+                        ),
+                    );
+                    crate::usage::append(&usage_path, &mk(&c.name, 503, "rate-limit", tried, false, tried_at));
+                    return reply_json(
+                        slot.take().unwrap(),
+                        503,
+                        &json!({ "type": "error",
+                                 "error": { "type": "overloaded_error",
+                                            "message": format!("多个号在几十秒内都回 HTTP 429 —— 限额在出口/套餐这一层，换号或冻号都没用。已闸住整条通道 {}s，请稍后重试", RATE_GATE_MS / 1000) } }),
+                    );
+                }
+                // 阶梯只记「确实是这个号的问题」那些失败。并发占用（3009）不算 —— 它只是此刻忙，
+                // 记进去会让一次全网抖动把好号一路顶到 5 分钟。
+                let counted = code != 3009;
+                let strikes = if counted { gw.bump_strike(&c.id) } else { 0 };
+                let cool = account_cooldown(status, code, strikes.max(1));
+                gw.freeze_account(&c.id, cool, freeze_label(status, code));
                 if status == 401 {
                     // 401 = 这一发用的凭证不被认。要是这个号还存着「上次试通」的指纹，说明它
                     // 已经失效了（重新登录、token_version 被吊销都会这样）—— 清掉提示回到默认
                     // 顺序，让人再点一次对话测试重新认一个，而不是抱着坏提示一路 401。
                     gw.drop_plan_hint(paths, &c.id);
                 }
-                // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL
-                gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
+                // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL。
+                // 但并发占用跟额度无关，重取只是白烧一次往返。
+                let refetched = if code == 3009 {
+                    false
+                } else {
+                    gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
+                    true
+                };
                 let d = backoff_ms(tried);
+                let code_note = if code != 0 { format!(" code={code}") } else { String::new() };
+                let ladder = if counted {
+                    format!("连续第 {strikes} 次")
+                } else {
+                    "并发占用，不计次".to_string()
+                };
                 crate::flowlog::log(
                     "relay",
                     "switch",
                     &format!(
-                        "外部 {} HTTP {status} → 冷却 {}s 并换下一个（退避 {d}ms，已安排重取额度）",
+                        "外部 {} HTTP {status}{code_note} → 冷却 {}s 并换下一个（{ladder}，退避 {d}ms，{}）",
                         c.name,
-                        cool / 1000
+                        cool / 1000,
+                        if refetched { "已安排重取额度" } else { "与额度无关，没重取" }
                     ),
                 );
                 std::thread::sleep(Duration::from_millis(d));
@@ -2904,6 +3146,12 @@ fn handle_external(
         {
             let mut g = gw.inner.lock().unwrap();
             g.served += 1;
+            // 这一发通了 = 之前那些「这个号不行」的证据作废：阶梯计数清零，
+            // 借道用掉的冷却也顺手撤掉，不用干等到期（判错的冷却不该继续惩罚好号）。
+            g.strikes.remove(&c.id);
+            if forgive.iter().any(|x| x == &c.id) {
+                g.blocked.remove(&c.id);
+            }
             if tried > 1 {
                 g.switched += 1;
             }
@@ -3261,10 +3509,15 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             }
             if v.get("edge").and_then(Value::as_bool) == Some(true) {
                 let left = gw.edge_reset();
+                let rate_left = gw.rate_reset();
                 crate::flowlog::log(
                     "relay",
                     "unfreeze",
-                    &format!("手动解除通道熔断（原本还剩 {}s）", left / 1000),
+                    &format!(
+                        "手动解除通道闸门：熔断原本还剩 {}s，限流闸原本还剩 {}s",
+                        left / 1000,
+                        rate_left / 1000
+                    ),
                 );
             }
             return reply_json(req, 200, &gw.console_status(&paths));
@@ -3868,10 +4121,57 @@ mod tests {
     }
 
     #[test]
-    fn production_and_probe_read_one_cooldown_rule() {
-        assert_eq!(account_cooldown(429), RATE_TTL_MS);
-        assert_eq!(account_cooldown(401), AUTH_COOLDOWN_MS);
-        assert!(AUTH_COOLDOWN_MS < RATE_TTL_MS, "凭证类失败不该把只有一个号的池子冻满五分钟");
+    fn cooldown_escalates_instead_of_locking_the_account_on_one_jitter() {
+        // 一次抖动只短冷却；同一个号**连续**挨打才升级，并封顶在 5 分钟
+        assert_eq!(account_cooldown(401, 0, 1), FIRST_COOLDOWN_MS);
+        assert_eq!(account_cooldown(401, 0, 2), FIRST_COOLDOWN_MS * 2);
+        assert_eq!(account_cooldown(429, 0, 3), FIRST_COOLDOWN_MS * 4);
+        assert_eq!(account_cooldown(429, 0, 99), MAX_COOLDOWN_MS, "阶梯要封顶");
+        // 3009 = 并发被占满，松手就没：不参与阶梯，也不许把额度重取烧掉
+        assert_eq!(account_cooldown(429, 3009, 7), CONC_COOLDOWN_MS);
+        // 与号无关的状态码不冻号（405 那类交给通道熔断）
+        assert_eq!(account_cooldown(405, 0, 3), 0);
+    }
+
+    #[test]
+    fn a_broken_connection_is_not_attributed_to_the_account() {
+        // 日志实测：10053/10054 这类本地中断一天 35 次，旧规则跟着 429 冻满 5 分钟，
+        // 于是「冻了→手点解冻→马上能用」。它必须比最小阶梯还短。
+        assert!(NET_COOLDOWN_MS < FIRST_COOLDOWN_MS);
+        assert!(NET_COOLDOWN_MS * 8 < MAX_COOLDOWN_MS, "更不该滚成长冷却");
+    }
+
+    #[test]
+    fn different_accounts_hitting_429_reads_as_one_shared_limit() {
+        let t0 = 1_000_000u64;
+        // 同一个号反复 429：还是这个号自己的事，不该闸整条通道
+        assert!(!is_shared_rate_limit(Some(("a", t0)), "a", t0 + 5_000));
+        // 换个号、还在窗口里：这就是出口/套餐级限流的形状
+        assert!(is_shared_rate_limit(Some(("a", t0)), "b", t0 + 5_000));
+        // 隔得够久的上一发不算数
+        assert!(!is_shared_rate_limit(
+            Some(("a", t0)),
+            "b",
+            t0 + RATE_SHARED_WINDOW_MS + 1
+        ));
+        // 没见过 429 就不算
+        assert!(!is_shared_rate_limit(None, "b", t0));
+    }
+
+    #[test]
+    fn freeze_reason_names_whose_fault_it_is() {
+        assert_eq!(freeze_label(429, 3009), "并发占用");
+        assert_eq!(freeze_label(401, 0), "凭证被拒");
+        assert_eq!(freeze_label(402, 0), "额度不足");
+        assert_eq!(freeze_label(429, 0), "上游限流");
+    }
+
+    #[test]
+    fn freeze_tag_stays_short_enough_for_the_status_column() {
+        // 那一列是 nowrap 的标签，写全「还剩 297 秒」会把号池表挤变形
+        assert_eq!(freeze_tag("网络中断", 14_400), "网络中断·14s");
+        assert_eq!(freeze_tag("上游限流", 297_000), "上游限流·5分");
+        assert_eq!(freeze_tag("凭证被拒", 0), "凭证被拒·1s", "别说「剩 0 秒」");
     }
 
     #[test]
