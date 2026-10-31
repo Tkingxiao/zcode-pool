@@ -22,6 +22,9 @@ const EDGE_COOLDOWN_MS: u64 = 60_000;
 /// 这一类状态码表示**这条路**不对（路由被关、方法不被允许、请求形状超限、被合规封掉），
 /// 而不是**这个号**不对。撞上就熔断整条通道，别把同一堵墙按号撞一遍。
 /// 405 是其中最常见的一个，另外兜进这张表的都是同一种形状，见 `handle_external`。
+///
+/// ⚠ 这张表不是 405 的最后一句话：405 也可能是业务服务自己回的 `{"code":3012}`（提示词判罚），
+/// 那种熔通道毫无用处 —— 判据的先后次序见 `upstream_verdict`。
 const PATH_STATUS: [u16; 11] = [404, 405, 406, 410, 411, 413, 414, 415, 451, 501, 505];
 
 /// 「关掉再打开」时，重新 bind 愿意重试多久。
@@ -36,6 +39,11 @@ const STOP_POKE_BUDGET_MS: u64 = 1_500;
 
 /// 上游自己 5xx：整条路都在冒烟，但通常是暂时的 —— 短熔断，恢复得比 405 快。
 const UPSTREAM_COOLDOWN_MS: u64 = 15_000;
+
+/// 业务服务回 `3012`（出站提示词与上游要求不一致）时的闸门。
+/// 刻意不跟 `EDGE_COOLDOWN_MS` 一样长：这不是通道不通，熔满 60s 既救不了它，
+/// 又把「一分钟内整池不出话」的假象叠在真毛病上。留 15s 只为别把上游打急。
+const PROMPT_COOLDOWN_MS: u64 = 15_000;
 
 /// 对话测试最多试几个候选凭证。每一发都是真请求（会占一点点额度），
 /// 所以上限压低：现在的号最多 3 个去重后的候选，留一位富余。
@@ -495,6 +503,9 @@ impl Gateway {
             "routed": routed,
             "routing": routing,
             "accounts": accounts,
+            // 通道级熔断还剩多久（0 = 没熔）。网页「接入」卡片靠它决定要不要显「立即放行」——
+            // console_status 早先没吐这个字段，那个按钮永远渲染不出来，判错了也只能干等 TTL。
+            "edgeLeft": g.edge.left(now),
 
             "channels": accs.iter().map(|a| json!({
                 "id": a.id,
@@ -1715,13 +1726,19 @@ fn freeze_tag(why: &str, left_ms: u64) -> String {
 
 /// 非 2xx 且**不是号的问题**时，这条应答怎么定性：`(给人看的标签, 熔断多久)`，0 = 不熔断。
 ///
-/// 优先级：先查明确列出的通道级状态码（路由被关、方法不许、501/505 这种"这条路本身不通"），
-/// 再兜 5xx（上游自己挂了，多半是暂时的，短熔断），再兜"没列进来但拿回一页 HTML"
-/// —— 实测的 405 拦页就是这一类形状。
-/// 剩下的 4xx 多半是这一发请求本身不对：**不熔断**，免得一个客户端的坏请求把整池锁 60 秒。
-/// 四种都不换号 —— 与号无关时换下一个只是把同一堵墙再撞一遍。
+/// ⚠ 先看应答体里的业务码，再看状态码 —— 405 有**两种相反的病因**，只看状态码就会判反：
+/// - 边缘 WAF 拦下的整页 HTML：请求根本没进业务服务，真·通道级，熔 60s 让它消停
+///   （实测换号没用、接着撞只会拦得更久，三分钟内累计 2870 发）；
+/// - 业务服务自己回的 `{"code":3012}`：请求进去了，是**出站提示词**跟上游要求不一致。
+///   这个熔 60s 纯属误伤 —— 60s 后同一份 body 出去还是 3012，于是「熔断 ↔ 3012」无限循环，
+///   而日志一直喊「通道被拦」，把人往查 WAF / 换出口上带（2026-10-31 线上就这么绕了一圈，
+///   真因是客户端 3.17.1 原地升级换了身份段文案，见 `prompt::cache_key`）。
+/// 两种都与号无关，都不换号。
 fn upstream_verdict(status: u16, snip: &str) -> (&'static str, u64) {
-    if PATH_STATUS.contains(&status) {
+    let code = peek_code(snip.as_bytes()).parse::<i64>().unwrap_or(0);
+    if code == 3012 {
+        ("出站提示词与上游要求不一致（换号、换出口都没用）", PROMPT_COOLDOWN_MS)
+    } else if PATH_STATUS.contains(&status) {
         ("通道被拦（与号无关，换号无意义）", EDGE_COOLDOWN_MS)
     } else if status >= 500 {
         ("上游故障", UPSTREAM_COOLDOWN_MS)
@@ -2391,9 +2408,11 @@ fn external_body(
 
     let caller = obj.get("system").cloned();
     let mut blocks = system_blocks(paths).map_err(|e| (503, e))?;
+    // 身份段发两遍 = 上游判 prompt 篡改（405/3012），所以调用方带来的那些块还要不要前置，
+    // 依据是**我们即将发的那两块的实际文本**，不是写死的常量：客户端升级换文案，写死的判据就认不出了。
     match caller {
         Some(Value::String(s)) if !s.trim().is_empty() => {
-            if !crate::prompt::is_canonical_identity(&s) {
+            if !crate::prompt::carries_identity(&blocks, &s) {
                 blocks.push(json!({ "type": "text", "text": s }))
             }
         }
@@ -2405,7 +2424,7 @@ fn external_body(
             let mut wants_cache = false;
             for b in a {
                 if let Some(t) = b.get("text").and_then(Value::as_str) {
-                    if t.trim().is_empty() || crate::prompt::is_canonical_identity(t) {
+                    if t.trim().is_empty() || crate::prompt::carries_identity(&blocks, t) {
                         continue;
                     }
                     if b.get("cache_control")
@@ -2447,7 +2466,7 @@ fn external_body(
 fn upstream_reason(code: i64) -> Option<&'static str> {
     match code {
         3009 => Some("并发超限 —— 同一个号的模型并发被占满（例：这个号正在官方客户端里用）"),
-        3012 => Some("提示词被判异常 —— 身份段重复或被改动"),
+        3012 => Some("出站提示词与上游要求不一致 —— 身份段重复/被改动，或本机缓存的 ZCode 文案比客户端旧"),
         _ => None,
     }
 }
@@ -2763,7 +2782,7 @@ fn handle_external(
             503,
             &json!({ "type": "error",
                      "error": { "type": "overloaded_error",
-                                "message": format!("上游这条通道正被边缘拦截（HTTP 405），已熔断冷却，约 {secs}s 后重新放行；期间不再出站") } }),
+                                "message": format!("上游这条通道在熔断冷却中，约 {secs}s 后重新放行；期间不再出站（原因见「反代」日志那行）") } }),
         );
     }
 
@@ -4005,7 +4024,10 @@ mod tests {
     use super::*;
 
     const HTML: &str = "<!doctypehtml><html lang=\"zh-cn\"><title>405</title>";
-    const JSON: &str = "{\"code\":3012,\"message\":\"unusual activity\"}";
+    // 线上真实形状：业务服务自己回的 3012（不是 WAF 的拦页）
+    const JSON: &str = "{\"code\":3012,\"msg\":\"unusual activity\"}";
+    // 「是一包 JSON、但不是提示词判罚」——用来测状态码那一档
+    const JSON_OTHER: &str = "{\"code\":7777,\"msg\":\"something else\"}";
 
     // bind / 端口释放：不碰 Gateway，所以能在测试二进制里跑（一碰 Gateway 就 STATUS_ENTRYPOINT_NOT_FOUND）
     #[test]
@@ -4054,27 +4076,42 @@ mod tests {
     #[test]
     fn listed_route_level_codes_trip_even_with_a_json_body() {
         for code in [404u16, 405, 406, 410, 413, 415, 451, 501, 505] {
-            assert_eq!(upstream_verdict(code, JSON).1, EDGE_COOLDOWN_MS, "{code}");
+            assert_eq!(upstream_verdict(code, JSON_OTHER).1, EDGE_COOLDOWN_MS, "{code}");
         }
     }
 
     #[test]
+    fn a_prompt_verdict_is_not_reported_as_a_blocked_channel() {
+        // 2026-10-31 线上那一发：405 + {"code":3012}。只看状态码就打成「通道被拦、熔 60s」，
+        // 于是所有人去查 WAF / 换出口，而真因是出站身份段比客户端旧一轮。
+        let (kind, ms) = upstream_verdict(405, JSON);
+        assert_eq!(ms, PROMPT_COOLDOWN_MS, "短闸门就够，熔 60s 救不了提示词");
+        assert!(ms < EDGE_COOLDOWN_MS);
+        assert!(kind.contains("提示词"), "定性要点名提示词，不能再说通道被拦：{kind}");
+        assert!(!kind.contains("通道被拦"), "{kind}");
+        // 业务码优先于状态码：换个非 405 的状态回 3012，照样按提示词判罚定性
+        assert_eq!(upstream_verdict(400, JSON).1, PROMPT_COOLDOWN_MS);
+        // 真·边缘拦页（HTML，没有业务码）不受影响，仍是长熔断
+        assert_eq!(upstream_verdict(405, HTML).1, EDGE_COOLDOWN_MS);
+    }
+
+    #[test]
     fn upstream_failure_gets_the_short_cooldown() {
-        assert_eq!(upstream_verdict(502, JSON).1, UPSTREAM_COOLDOWN_MS);
+        assert_eq!(upstream_verdict(502, JSON_OTHER).1, UPSTREAM_COOLDOWN_MS);
         assert_eq!(upstream_verdict(503, HTML).1, UPSTREAM_COOLDOWN_MS);
     }
 
     #[test]
     fn a_bad_request_from_one_client_must_not_freeze_the_pool() {
         // 没见过的 4xx：多半是这一发请求不对，熔断会把所有号一起锁住
-        assert_eq!(upstream_verdict(400, JSON).1, 0);
+        assert_eq!(upstream_verdict(400, JSON_OTHER).1, 0);
         assert_eq!(upstream_verdict(422, HTML).1, EDGE_COOLDOWN_MS); // 但 HTML 仍按被拦处理
     }
 
     #[test]
     fn odd_statuses_are_rejected_without_retry_or_trip() {
-        assert_eq!(upstream_verdict(302, JSON).1, 0);
-        assert_eq!(upstream_verdict(200, JSON).1, 0); // 2xx 走不到这里，兜底也要给 0
+        assert_eq!(upstream_verdict(302, JSON_OTHER).1, 0);
+        assert_eq!(upstream_verdict(200, JSON_OTHER).1, 0); // 2xx 走不到这里，兜底也要给 0
         assert_eq!(upstream_verdict(100, "").1, 0);
     }
 
@@ -4362,5 +4399,74 @@ mod tests {
         assert_eq!(session_key(empty_msgs.as_bytes(), "k"), "", "空对话钉不出意义，全落一个常量指纹反而更糟");
         let blanks = r#"{"system":"","messages":[{"content":"  "}]}"#;
         assert_eq!(session_key(blanks.as_bytes(), "k"), "", "只有空白文本也算读不到");
+    }
+
+    /// 真机端到端：拿号池里的真凭证，走**和生产一模一样**的出站路径发三发。
+    /// 会烧掉一点点额度（max_tokens 64），所以默认不跑。
+    /// 手工跑：`cargo test --lib gateway -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_turns_pass_on_the_current_client_generation() {
+        let paths = store::Paths::detect();
+        let acc = store::list_accounts(&paths)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .expect("号池是空的");
+        let secret = crate::zcrypto::default_secret(&paths.home);
+        let toks = crate::quota::candidate_tokens(&acc.credentials, acc.config.as_ref(), &secret);
+        assert!(!toks.is_empty(), "这个号没有可用凭证");
+        let mid = acc.virtual_device_mid.clone().unwrap_or_default();
+        let model = EXTERNAL_MODELS[0].to_string();
+        let sess = account_session(&acc.id, &day_seed());
+        let agent = relay_agent(None, 45);
+        let target = format!("{UPSTREAM}/v1/messages");
+        let start = pick_token_index(&toks, acc.plan_token.as_deref());
+        let order: Vec<usize> = (0..toks.len()).map(|k| (start + k) % toks.len()).take(MAX_PROBE_TOKENS).collect();
+
+        // ① 普通第三方客户端（不带 system）
+        // ② 3.17.1 的 ZCode 客户端自己：它的 system 已经带着身份段，反代不能再前置一份
+        let cur = system_blocks(&paths).expect("抽取当前身份段失败");
+        let cases: Vec<(&str, Value)> = vec![
+            ("① 不带 system", json!(null)),
+            ("② 调用方自带身份段", Value::Array(cur.clone())),
+        ];
+
+        for (tag, caller_system) in cases {
+            let mut body = json!({
+                "model": model,
+                "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "reply with exactly: ok" }],
+            });
+            if !caller_system.is_null() {
+                body.as_object_mut().unwrap().insert("system".into(), caller_system);
+            }
+            let out_body = external_body(body.to_string().as_bytes(), &mid, &model, &sess, &paths)
+                .expect("组装请求失败");
+            let sent = String::from_utf8_lossy(&out_body);
+            let dup = cur
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .filter(|t| sent.matches(&t.trim_start().chars().take(48).collect::<String>()).count() > 1)
+                .count();
+            assert_eq!(dup, 0, "{tag}：身份段在出站体里出现了不止一遍，上游必判 3012");
+
+            let mut verdict = String::new();
+            for i in order.iter() {
+                let r = set_relay_headers(agent.request("POST", &target), &toks[*i]).send_bytes(&out_body);
+                let (status, text) = match r {
+                    Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
+                    Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
+                    Err(e) => { verdict = format!("传输失败 {e}"); continue; }
+                };
+                let snip = crate::quota::body_snippet(&text);
+                verdict = format!("HTTP {status}｜{snip}");
+                if (200..300).contains(&status) {
+                    break;
+                }
+            }
+            println!("{tag} → {verdict}");
+            assert!(verdict.starts_with("HTTP 2"), "{tag} 没出话：{verdict}");
+        }
     }
 }

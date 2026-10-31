@@ -6,33 +6,49 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-const PROMPT_PREFIX: &str = "You are ZCode, an interactive coding agent";
+/// 客户端身份段的**形状**判据，不是内容判据（理由见 `validate`）。
+const PREFIX_HEAD: &str = "You are ZCode, an interactive";
+const IDENTITY_HEAD: &str = "You are an ";
 
-/// 服务端只校验到身份段为止：`system` 必须恰好是「固定前缀 + 身份段」两块，且逐字节相等。
-/// 身份段之后的 Desktop Context / Session guidance / Environment / Context management
-/// 全部可有可无（实测：把它们整段删掉照样 200，改动身份段里任意一个字符就 3012）。
-///
-/// 所以这里**有意只发这两块**。被丢掉的那些段落要么点名客户端专属的东西
-/// （`::code-comment` 指令、`/<skill>` 走 Skill 工具），要么把本机路径、
-/// 伪造的环境信息塞进每一次请求里 —— 对第三方客户端全是噪音。
-const IDENTITY_PREFIX: &str = "You are an interactive ZCode agent";
-
-/// 调用方自己带来的 system 是否已经是官方那两块。
-///
-/// 上游按身份段在 `system` 里的**出现次数**判 prompt 篡改：同一份身份段再出现一次，
+/// 上游按身份段在 `system` 里的**出现次数**判 prompt 篡改：同一份身份段多出现一次，
 /// 就回 405 `{"code":3012,...unusual activity}`（实测见 gateway 的 external_body）。
-/// 调用方若就是 ZCode 客户端本身，它的 system 开头已经是这两块，反代再前置一份就成两份。
-pub fn is_canonical_identity(text: &str) -> bool {
+///
+/// 判据必须是**本机客户端现在这两块的实际文本**，不能是写死的常量 —— 3.17.1 那次升级
+/// 把两块文案都换了（旧：`You are ZCode, an interactive coding agent` + `You are an
+/// interactive ZCode agent that helps users…`），照旧常量比对就会漏认调用方自带的身份段、
+/// 前置成两份，当场 3012。
+///
+/// `sig` 取每块开头一段（去掉首部的空白与换行）：客户端整段搬自家提示词的形态，
+/// 出现在文本任何位置都算已经带上，不必非在开头。
+pub fn carries_identity(blocks: &[Value], text: &str) -> bool {
     let t = text.trim_start();
-    t.starts_with(PROMPT_PREFIX) || t.starts_with(IDENTITY_PREFIX)
+    if t.is_empty() {
+        return false;
+    }
+    let sig: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .map(|s| s.trim_start().to_string())
+        .collect();
+    if sig.iter().any(|s| t.starts_with(s.as_str())) {
+        return true;
+    }
+    sig.iter()
+        .map(|s| s.chars().take(48).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .any(|s| text.contains(s.as_str()))
 }
 
 const OVERRIDE_NAME: &str = "system_prompt.json";
 
-/// 缓存的失效依据：从哪个 `zcode.cjs` 抽的就记哪个，换路径后旧的必须作废。
+/// 缓存的失效依据：从哪个 `zcode.cjs` 抽的就记哪个，**并按内容指纹记**。
 ///
 /// 按 settings.json 的文件指纹（mtime+len）缓存：界面保存和外部手改都能覆盖，
 /// 没变动时每请求退化成一次 stat，不再读文件解析 + 逐个探测候选路径。
+///
+/// ⚠ 早先这里只记 cjs 的**路径**。客户端原地升级（路径不变、文案换了）就永远冲不掉缓存 ——
+/// 2026-10-31 那次 3012 就是这么来的：10-24 抽的旧文案发到 10-29 升级后的上游，每发必拦。
+/// 所以键里必须带上 cjs 自己的 mtime + 长度。
 pub fn cache_key(paths: &Paths) -> String {
     static K: std::sync::Mutex<
         Option<((Option<std::time::SystemTime>, Option<u64>), String)>,
@@ -48,11 +64,23 @@ pub fn cache_key(paths: &Paths) -> String {
             return k.clone();
         }
     }
-    let k = find_zcode_cjs(paths)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    *g = Some((stamp, k.clone()));
-    k
+    let key = match find_zcode_cjs(paths) {
+        Some(p) => match fs::metadata(&p) {
+            Ok(m) => {
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                format!("{}?{mt}-{}", p.to_string_lossy(), m.len())
+            }
+            Err(_) => p.to_string_lossy().into_owned(),
+        },
+        None => String::new(),
+    };
+    *g = Some((stamp, key.clone()));
+    key
 }
 
 pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
@@ -70,7 +98,7 @@ pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
             Ok(v) => {
                 let from = v.get("source").and_then(Value::as_str).unwrap_or("");
                 if from != key {
-                    eprintln!("[prompt] 缓存来自另一个 ZCode（{from}），重新抽取");
+                    eprintln!("[prompt] 缓存来自另一份 ZCode 提示词（{from}），重新抽取");
                 } else {
                     match v.get("blocks").and_then(Value::as_array).cloned() {
                         Some(b) => match validate(&b) {
@@ -137,9 +165,15 @@ fn validate(blocks: &[Value]) -> Result<(), String> {
         texts.push(t.to_string());
     }
 
-    if texts[0] != PROMPT_PREFIX {
+    // 只断言形状，不断言字面量：逐字节照抄本机客户端抽出来的那两块就行，
+    // 因为**上游才是比对的那一方** —— 客户端升级换了文案，写死常量的校验反而把新文案判成
+    // 「不合规」，于是永远发旧的那两块出去挨 3012（2026-10-31 实测踩过）。
+    // 客户端专属的 Desktop Context / Environment 等段落照样有意不发：它们要么点名
+    // `::code-comment`、`/<skill>` 这类客户端指令，要么把本机路径塞进每一次请求。
+    if !texts[0].starts_with(PREFIX_HEAD) || texts[0].chars().count() > 200 {
         return Err(format!(
-            "block0 不等于固定前缀（实得 {} 字符）",
+            "block0 不像固定前缀（起头 {:?}，{} 字符）",
+            texts[0].chars().take(24).collect::<String>(),
             texts[0].chars().count()
         ));
     }
@@ -152,13 +186,14 @@ fn validate(blocks: &[Value]) -> Result<(), String> {
         }
     }
 
-    if !texts[1].trim_start().starts_with(IDENTITY_PREFIX) {
-        let head: String = texts[1].trim_start().chars().take(40).collect();
+    let b1 = texts[1].trim_start();
+    if !b1.starts_with(IDENTITY_HEAD) {
+        let head: String = b1.chars().take(40).collect();
         return Err(format!("block1 不以身份段开头（实得 {head:?}）"));
     }
     let l1 = texts[1].chars().count();
-    if !(800..=8000).contains(&l1) {
-        return Err(format!("block1 长度 {l1} 不在 [800,8000]"));
+    if !(800..=16000).contains(&l1) {
+        return Err(format!("block1 长度 {l1} 不在 [800,16000]"));
     }
     Ok(())
 }
@@ -1762,7 +1797,9 @@ fn parse_function_at(src: &Rc<str>, i: usize) -> Result<FuncDef, String> {
     if k == nstart {
         return Err("函数头解析失败：缺函数名".to_string());
     }
-    let name = src[i + nstart..i + k].to_string();
+    // nstart / k 已经从 i 起扫过一遍，是**绝对**下标；再补一次 i 就偏移两遍 ——
+    // 函数名切片要么截到别处的文本，要么直接越界 panic（3.17.1 的 bundle 就是后者）
+    let name = src[nstart..k].to_string();
     while k < n && b[k].is_ascii_whitespace() {
         k += 1;
     }
@@ -1834,4 +1871,99 @@ fn split_top_commas(s: &str) -> Vec<String> {
     }
     out.push(buf);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocks(a: &str, b: &str) -> Vec<Value> {
+        vec![
+            json!({ "type": "text", "text": a, "cache_control": { "type": "ephemeral" } }),
+            json!({ "type": "text", "text": b, "cache_control": { "type": "ephemeral" } }),
+        ]
+    }
+
+    fn filler(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    #[test]
+    fn validation_follows_the_client_instead_of_a_hardcoded_literal() {
+        // 3.16 那代文案（写死常量时认的就是它）
+        assert!(validate(&blocks(
+            "You are ZCode, an interactive coding agent",
+            &format!("\nYou are an interactive ZCode agent that helps users. {}", filler(900))
+        ))
+        .is_ok());
+        // 3.17.1 换代的文案 —— 旧校验会把它判成「不合规」，于是永远发旧的那两块出去挨 3012
+        assert!(validate(&blocks(
+            "You are ZCode, an interactive agent",
+            &format!("\nYou are an agent working with the user toward their goals. {}", filler(3000))
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn validation_still_rejects_garbage() {
+        // 前缀对不上、身份段太短、静默降级留下的模板残渣，都还得拦住
+        assert!(validate(&blocks(
+            "You are Someone else",
+            &format!("\nYou are an agent {}", filler(900))
+        ))
+        .is_err());
+        assert!(validate(&blocks("You are ZCode, an interactive agent", "\nYou are an agent 太短")).is_err());
+        assert!(validate(&blocks(
+            "You are ZCode, an interactive agent",
+            &format!("\nYou are an agent {} {}", "${TOP_LEVEL}", filler(900))
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn a_client_that_already_carries_the_identity_is_not_prefixed_a_second_time() {
+        // 身份段发两遍 = 上游 405/3012，所以调用方自带的这些块不能再前置一份
+        let cur = blocks(
+            "You are ZCode, an interactive agent",
+            &format!("\nYou are an agent working with the user toward their goals. {}", filler(3000)),
+        );
+        assert!(carries_identity(&cur, "You are ZCode, an interactive agent\n\n然后是其自家提示词"));
+        assert!(carries_identity(
+            &cur,
+            "\nYou are an agent working with the user toward their goals. xxx"
+        ));
+        // 塞在中间也算（旧判据只认开头，3.17.1 换文案后当场漏认）
+        assert!(carries_identity(
+            &cur,
+            &format!("先说点别的。\n\nYou are an agent working with the user toward their goals. xxx")
+        ));
+        assert!(!carries_identity(&cur, "你是个小助手"), "无关文本得照常前置调用方的提示词");
+        assert!(!carries_identity(&cur, "   "), "空白不算");
+    }
+
+    /// 拿本机真装的客户端验一遍抽取 + 校验（换机器就没那个文件，所以默认不跑）。
+    /// 手工跑：`cargo test --lib prompt -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn extraction_works_against_the_installed_client() {
+        let paths = store::Paths::detect();
+        let key = cache_key(&paths);
+        println!("缓存键（含 cjs 指纹）：{key}");
+        let b = system_blocks(&paths).expect("抽取失败");
+        for (i, x) in b.iter().enumerate() {
+            let t = x.get("text").and_then(Value::as_str).unwrap_or("");
+            println!("  block{i} len={} 起头 {:?}", t.chars().count(), t.chars().take(46).collect::<String>());
+        }
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn function_name_is_cut_at_absolute_offsets() {
+        // 函数不在串首时，偏移只能算一次。旧写法 `src[i + nstart..i + k]` 在这一发上直接 panic
+        let pad = "x".repeat(4000);
+        let src: Rc<str> = Rc::from(format!("{pad}\nfunction buildIt(a, b) {{ return a + b; }}").as_str());
+        let i = src.find("function ").unwrap();
+        let f = parse_function_at(&src, i).expect("函数头解析失败");
+        assert_eq!(f.params.len(), 2, "参数得从函数自己的括号里取");
+    }
 }
