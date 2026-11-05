@@ -5,9 +5,27 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
+
+/// 2026-11-05：**可领资格不在 `billing/preview`，在这条投放里**。
+///
+/// 实测：`billing/preview` 对所有号都只回 `{"code":0,"msg":""}` —— 连 `data` 都没有（换凭证、
+/// 换 `platform`、换 `app_version`、带不带 mid 都一样；官方客户端自己把这种应答当错误抛，
+/// 见 app.asar 里的 `manual_claim_preview_missing_data`）。于是工具的「查可领套餐」永远是 0 个，
+/// 手动领取也走不到 POST（`claim_start_inner` 要先在列表里找 plan_id）。
+///
+/// 而 `/api/v1/marketing/touch?seq=n` 给未领的号回一条 delivery：
+/// `banner.buttons[].action = { type: "claim_zcode_plan", args: { plan_id } }`，
+/// 完整套餐对象在 `banner.background.bundle.args.zcode_plan`（plan_id / name / priority /
+/// starts_at / ends_at / entitlements[]，字段与 billing 那边一致，直接复用 `parse_plan`）；
+/// 已经领过的号 `deliveries` 是空数组。
+///
+/// ⚠ 只有带 `claim_zcode_plan` 按钮的投放才算「可领」：别的活动里塞的 plan 不能替用户点。
+pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch";
+
+/// 客户端带的是自增 seq（`seq=0,1,2…`），这里给一个进程内的递增计数就够。
+static TOUCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
@@ -245,12 +263,100 @@ pub fn preview_plans(
 ) -> Result<Vec<ClaimPlan>, String> {
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let url = format!(
-        "{BILLING_PREVIEW_URL}?app_version={}&platform={}",
-        quota::zcode_app_version(),
-        quota::client_platform()
-    );
-    preview_once(&url, &token, device_mid)
+    let seq = TOUCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let url = format!("{MARKETING_TOUCH_URL}?seq={seq}");
+    let mut req = agent().get(&url);
+    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.touch_req"), e))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(failure_message(code, &v));
+    }
+    let deliveries = v
+        .pointer("/data/deliveries")
+        .and_then(Value::as_array)
+        // 空数组 = 这个号确实没有可领（已领过的号就是这样）；
+        // **没有 data 是另一回事** —— 那是应答缺字段，报出来，别替上游说「你没资格」。
+        .ok_or_else(|| crate::i18n::tr("err.claim.touch_no_data"))?;
+    Ok(plans_from_deliveries(deliveries))
+}
+
+/// 投放 → 可领套餐：只认**带 `claim_zcode_plan` 按钮**的那几档，且 plan_id 要对得上。
+/// 别的活动里塞的套餐不能替用户点，所以宁可不显示。
+fn plans_from_deliveries(deliveries: &[Value]) -> Vec<ClaimPlan> {
+    let mut out: Vec<ClaimPlan> = Vec::new();
+    for d in deliveries {
+        let mut wanted: Vec<String> = Vec::new();
+        collect_claim_plan_ids(d, &mut wanted);
+        if wanted.is_empty() {
+            continue;
+        }
+        let mut found: Vec<&Value> = Vec::new();
+        collect_zcode_plans(d, &mut found);
+        for p in found.iter().filter_map(|p| parse_plan(p)) {
+            if wanted.iter().any(|w| *w == p.plan_id) && !out.iter().any(|e| e.plan_id == p.plan_id) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    out
+}
+
+fn collect_claim_plan_ids(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.get("type").and_then(Value::as_str) == Some("claim_zcode_plan") {
+                if let Some(id) = m
+                    .get("args")
+                    .and_then(|a| a.get("plan_id"))
+                    .and_then(Value::as_str)
+                {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        out.push(id);
+                    }
+                }
+            }
+            for x in m.values() {
+                collect_claim_plan_ids(x, out);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                collect_claim_plan_ids(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 套餐对象挂在投放的展示资源里（banner / hero 的 `args.zcode_plan`），层级会变，
+/// 所以按**键名**递归找，而不是写死一条 pointer 路径。
+fn collect_zcode_plans<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if k == "zcode_plan" {
+                    out.push(x);
+                }
+                collect_zcode_plans(x, out);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                collect_zcode_plans(x, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {
@@ -265,31 +371,6 @@ fn http_err(prefix: &str, e: ureq::Error) -> String {
         return format!("{prefix} HTTP {code}: {msg}");
     }
     format!("{prefix} {e}")
-}
-
-fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
-    let mut req = agent().get(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
-        req = req.set(&k, &v);
-    }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        return Err(failure_message(code, &v));
-    }
-    let plans = v
-        .pointer("/data/plans")
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
-    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
-    Ok(out)
 }
 
 pub fn submit_claim(
@@ -463,3 +544,82 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-11-05 从「178」号真实投放里原样摘下来的结构（去掉与判定无关的样式字段）
+    const TOUCH: &str = r#"{
+      "code":0,"msg":"","data":{"server_time":1793893803,"language":"zh-CN","deliveries":[
+        {"campaign_id":"2101141259813175296","resource_position":"banner","priority":50,
+         "banner":{
+           "buttons":[
+             {"action":{"type":"close","args":null}},
+             {"action":{"type":"claim_zcode_plan","args":{"plan_id":"zcode-v3-start-plan-1105"}}}],
+           "background":{"type":"bundle","bundle":{
+             "bundle":{"src":"https://cdn-zcode.z.ai/marketing/touch/assets/x.zip","entry":"index.html"},
+             "args":{"zcode_plan":{"plan_id":"zcode-v3-start-plan-1105","name":"ZCODE GLOBAL BUILD",
+               "priority":111,"starts_at":1793876400,"ends_at":1793926800,
+               "entitlements":[{"entitlement_id":"ent-zcode-v3-start-plan-1105-1",
+                 "show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token",
+                 "grant_units":300000000,"period":"one_time","priority":101}]}}}}}}]}}"#;
+
+    fn deliveries(v: &Value) -> Vec<Value> {
+        v.pointer("/data/deliveries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn finds_the_claimable_plan_in_a_real_delivery() {
+        let v: Value = serde_json::from_str(TOUCH).unwrap();
+        let plans = plans_from_deliveries(&deliveries(&v));
+        assert_eq!(plans.len(), 1, "真实投放里那一档应当被认出来");
+        let p = &plans[0];
+        assert_eq!(p.plan_id, "zcode-v3-start-plan-1105");
+        assert_eq!(p.name, "ZCODE GLOBAL BUILD");
+        assert_eq!(p.priority, 111);
+        assert_eq!(p.grants.len(), 1);
+        assert!(p.grants[0].contains("300M"), "{:?}", p.grants[0]);
+        assert!(p.grants[0].contains("GLM-5.3-Flash"), "{:?}", p.grants[0]);
+    }
+
+    #[test]
+    fn a_plan_without_a_claim_button_is_not_offered() {
+        // 别的活动里也可能塞着套餐对象：没有 claim_zcode_plan 按钮就不能替用户点
+        let v: Value = serde_json::from_str(
+            r#"{"deliveries":[{"banner":{"background":{"bundle":{"args":{"zcode_plan":{
+              "plan_id":"p-quiet","name":"偷偷塞的","entitlements":[]}}}}}}]}"#,
+        )
+        .unwrap();
+        assert!(plans_from_deliveries(v.get("deliveries").unwrap().as_array().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn empty_deliveries_means_nothing_to_claim_not_an_error() {
+        // 已领过的号：deliveries 是空数组 —— 这才是真的「没有可领」
+        let v: Value = serde_json::from_str(r#"{"code":0,"data":{"deliveries":[]}}"#).unwrap();
+        assert!(plans_from_deliveries(&deliveries(&v)).is_empty());
+        // 而没有 data 是另一回事（上面 preview_plans 里会走 Err 分支）
+        let bare: Value = serde_json::from_str(r#"{"code":0,"msg":"","logid":"x"}"#).unwrap();
+        assert!(bare.pointer("/data/deliveries").and_then(Value::as_array).is_none());
+    }
+
+    #[test]
+    fn dedups_the_same_plan_repeated_across_banner_and_popup() {
+        // 真实应答里同一个 zcode_plan 在 banner 和 success_popup 各挂了一份，不能显示两遍
+        let v: Value = serde_json::from_str(
+            r#"{"deliveries":[{"banner":{
+                "buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-1"}}}],
+                "background":{"bundle":{"args":{"zcode_plan":{"plan_id":"p-1","name":"同一档","entitlements":[]}}}},
+                "success_popup":{"buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-1"}}}],
+                  "hero":{"bundle":{"args":{"zcode_plan":{"plan_id":"p-1","name":"同一档","entitlements":[]}}}}}}}]}"#,
+        )
+        .unwrap();
+        let plans = plans_from_deliveries(v.get("deliveries").unwrap().as_array().unwrap());
+        assert_eq!(plans.len(), 1, "同一档只该出现一次，实得 {:?}", plans);
+    }
+}
+

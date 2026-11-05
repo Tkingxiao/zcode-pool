@@ -55,6 +55,15 @@ jobs:
           releaseBody: |
             本版修复 / 改进
 
+            - **修掉「查不到可领套餐、于是永远领不到」**：可领资格从 11-05 起不在
+              <span class="mono">billing/preview</span> 里 —— 那个接口对所有号只回
+              <span class="mono">{"code":0,"msg":""}</span>，连 <span class="mono">data</span> 都没有
+              （官方客户端把这种应答当错误抛：<span class="mono">manual_claim_preview_missing_data</span>），
+              而工具的「查可领套餐」把它读成「零个」，领取又要先在列表里找到 plan_id，于是手动、自动全都走不到那一发 POST。
+              现在列表改从 <span class="mono">/api/v1/marketing/touch</span> 的投放里读：
+              领取按钮是 <span class="mono">action.type = "claim_zcode_plan"</span>，套餐对象挂在
+              <span class="mono">banner…args.zcode_plan</span>；只认带领取按钮的那一档（别的活动里塞的套餐不替用户点），
+              而「应答缺 data」改成报错，不再替上游说「你没资格」。实测：那个一直领不到的号一键领上 300M。
             - **修掉「上游每一发都回 405、整池每 60 秒停摆」**：官方客户端 10-29 原地升级到
               3.17.1，两块 <span class="mono">system</span> 身份段整段换了文案（旧那句
               "You are an interactive ZCode agent" 在包里一处都不剩），而反代还在发上一代那两块 ——
