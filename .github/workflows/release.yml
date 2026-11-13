@@ -50,11 +50,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.6' }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.7' }}
           releaseName: 'Z·POOL ${{ github.ref_name }}'
           releaseBody: |
             本版修复 / 改进
 
+            - **修掉「benchmark 一跑就整通道卡死，而客户端 6 个 agent 没事」**：上游随 429 返回的
+              并发码多了一族 <span class="mono">3008</span>（单号并发被占满，与 <span class="mono">3009</span> 同族）。
+              以前只豁免 <span class="mono">3009</span>，于是 3008 既进冻结阶梯（30s→60s→120s 越冻越久），
+              又喂出口闸门 —— 实测同一分钟里 178 还在正常出 5.7MB 长流、129 却连报 3008，
+              闸门照样判「出口级限流」把整条通道闸 60s，每 ~85s 循环一轮。
+              现在 3008 与 3009 同待遇：只换号 + 15s 短冷却，不冻号、不闸门、不重取额度。
+            - **修掉「6 个子 agent 只活 2 个」的分流连坐**：新会话全被占用时不再回队首 ——
+              改按挂载会话数挑最闲的号（有闲号时行为与旧版一致）；一个请求只给出口闸门记
+              **第一发** 429，failover 链上后续的 429 是同一份洪峰的溢出，不再算独立证据；
+              会话在哪个号上吃 429 就当场解钉，闸门一开不再原路撞回同一个号。
+            - **上游新拒绝码 1210 说人话**：GLM-5.3-Flash 改为「始终思考」，请求带关闭思考
+              会被 400+1210 秒拒。日志现在直接写修法：把思考强度从 off 调成 low/medium/high，换号没用。
             - **修掉「查不到可领套餐、于是永远领不到」**：可领资格从 11-05 起不在
               <span class="mono">billing/preview</span> 里 —— 那个接口对所有号只回
               <span class="mono">{"code":0,"msg":""}</span>，连 <span class="mono">data</span> 都没有
