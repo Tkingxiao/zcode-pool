@@ -348,6 +348,8 @@ struct Inner {
     strikes: HashMap<String, (u64, u32)>,
 
     /// 上一发 429 落在哪个号身上、什么时候。用来认「跨号级联 = 出口级限流」那个形状。
+    /// 只记每个请求的**第一发** 429 —— failover 链上后续的 429 是同一份洪峰的溢出，
+    /// 记进去等于把一份过载复制成多份「独立证据」，闸门就会误伤。并发占用码不记。
     last_429: Option<(String, u64)>,
 
     /// 上游通道熔断状态（与号无关，整条通道共用一个）
@@ -1483,13 +1485,12 @@ impl Gateway {
                 return list;
             }
         }
-        // 新会话（或原来那个号已经不在候选里了）：挑一个别人没占的号
-        let used: std::collections::HashSet<String> = list
+        // 新会话（或原来那个号已经不在候选里了）：按当前挂载的会话数挑最闲的号
+        let load: Vec<usize> = list
             .iter()
-            .filter(|c| g.sticky.values().any(|(id, _)| id == &c.id))
-            .map(|c| c.id.clone())
+            .map(|c| g.sticky.values().filter(|(id, _)| *id == c.id).count())
             .collect();
-        let i = pick_for_new_session(&list, &used);
+        let i = pick_for_new_session(&list, &load);
         let id = list[i].id.clone();
         if g.sticky.len() >= STICKY_MAX {
             // 到上限就丢最久没用的那条，这张表不许无界增长
@@ -1510,6 +1511,20 @@ impl Gateway {
         let mut g = self.inner.lock().unwrap();
         if g.policy != POLICY_PINNED {
             g.sticky.insert(skey.to_string(), (id.to_string(), now_ms()));
+        }
+    }
+
+    /// 本会话在这个号上吃了 429：若正钉着它就就地解开，别让下一发原路撞回同一个号。
+    /// 这一发 failover 成功的话 `set_sticky` 自会钉到落点，两处不冲突；解不开的是
+    /// failover 也没走通的那些（闸门、试尽）—— 以前那种情况会话会一直回头撞旧号，
+    /// 闸门一开就是下一轮 429（2026-11-03 实测连着闸了两轮就是这么来的）。
+    fn unpin_sticky(&self, skey: &str, id: &str) {
+        if skey.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.sticky.get(skey).map(|(x, _)| x.as_str()) == Some(id) {
+            g.sticky.remove(skey);
         }
     }
 
@@ -1669,10 +1684,19 @@ fn escalating_cooldown(n: u32) -> u64 {
 
 /// 这一发该不该把这个号冻起来、冻多久。`code` 是从应答体里认出来的上游业务码。
 /// 返回 0 = 不冻（跟号无关，交给通道闸门/熔断去处理）。
+/// 上游的**并发占用**业务码（都随 429 返回）：这个号此刻忙，松手就没 —— 不是号的错，
+/// 更不是出口的事。3009 = 模型并发满（老码）；3008 = 2026-11 上游开始返回的新码
+/// （实测同一分钟里 178 正常出 5.7MB 长流、129 却连报 3008 → 单号占用形状，与 3009 同族）。
+/// 这两族只该「换号 + 短冷却」：进冻结阶梯会越冻越久，进出口闸门更会把「一个号忙」
+/// 放大成「全网故障」—— 2026-11-14 benchmark 全通道卡死的正根因就是 3008 没被豁免。
+fn is_concurrency_code(code: i64) -> bool {
+    code == 3009 || code == 3008
+}
+
 fn account_cooldown(status: u16, code: i64, strikes: u32) -> u64 {
     match status {
-        // 3009 = 这个号的并发被占满（正在官方客户端里说话之类），松手就没 —— 短冷却就够
-        429 if code == 3009 => CONC_COOLDOWN_MS,
+        // 并发占用（3009/3008）= 号在忙，松手就没 —— 短冷却就够，不许滚阶梯
+        429 if is_concurrency_code(code) => CONC_COOLDOWN_MS,
         401 | 402 | 403 | 429 => escalating_cooldown(strikes),
         _ => 0,
     }
@@ -1681,7 +1705,7 @@ fn account_cooldown(status: u16, code: i64, strikes: u32) -> u64 {
 /// 面板状态列上的一句话原因。
 fn freeze_label(status: u16, code: i64) -> &'static str {
     match status {
-        429 if code == 3009 => "并发占用",
+        429 if is_concurrency_code(code) => "并发占用",
         401 => "凭证被拒",
         402 => "额度不足",
         403 => "访问被拒",
@@ -2466,7 +2490,11 @@ fn external_body(
 fn upstream_reason(code: i64) -> Option<&'static str> {
     match code {
         3009 => Some("并发超限 —— 同一个号的模型并发被占满（例：这个号正在官方客户端里用）"),
+        3008 => Some("并发被占满（3008，与 3009 同族）—— 这个号此刻忙，稍等或换号即可，不用管额度"),
         3012 => Some("出站提示词与上游要求不一致 —— 身份段重复/被改动，或本机缓存的 ZCode 文案比客户端旧"),
+        // 2026-11-14 实测：GLM-5.3-Flash 改为「始终思考」，请求带 thinking 关闭/思考强度 off
+        // 会被 400+1210 秒拒。这是请求形状问题，与号无关（换号、重试都一样），修法在客户端。
+        1210 => Some("该模型始终思考，上游不接受关闭思考 —— 把思考强度从 off 改成 low/medium/high 即可，换号没用"),
         _ => None,
     }
 }
@@ -2745,10 +2773,19 @@ fn pick_accounts(
     list
 }
 
-/// 新会话该钉哪个号：按 policy 排好的顺序找第一个**还没被别的会话占用**的号；
-/// 全被占用就回到队首 —— 此时共用一个号好过把请求判成「池子里没人」。
-fn pick_for_new_session(list: &[Candidate], used: &std::collections::HashSet<String>) -> usize {
-    list.iter().position(|c| !used.contains(&c.id)).unwrap_or(0)
+/// 新会话该钉哪个号：按 policy 排好的顺序挑**挂载会话最少**的那个 —— 没人占的号挂载为 0，
+/// 平票取先者，所以「有闲号」时跟旧的「找第一个没被占用的」行为完全一致；全被占用时挑最闲的，
+/// 不再回队首 —— 以前多出来的会话全堆到队首同一个号上，单号并发直接顶爆
+/// （2026-11-03 实测：129 一分钟 11 发、连环 429，6 个子 agent 只活下来 2 个）。
+fn pick_for_new_session(list: &[Candidate], load: &[usize]) -> usize {
+    debug_assert_eq!(list.len(), load.len(), "load 与 list 一一对应");
+    let mut best = 0;
+    for (i, n) in load.iter().enumerate() {
+        if *n < load[best] {
+            best = i;
+        }
+    }
+    best
 }
 
 fn handle_external(
@@ -2911,6 +2948,9 @@ fn handle_external(
 
     let mut tried = 0usize;
 
+    // 本请求是否已经记过 429 证据：一个请求最多贡献一份（见 last_429 的注释）。
+    let mut saw_429 = false;
+
     let mut last_abnormal: Option<(u16, Option<String>, Vec<u8>, Box<dyn std::io::Read + Send>)> = None;
 
     let mut last_acct = String::new();
@@ -2983,8 +3023,8 @@ fn handle_external(
         //    上游自己挂了）换号只是把同一堵墙再撞一遍 —— 实测 405 三分钟内累计 2870 发。
         if !(200..300).contains(&status) {
             if SWITCH_STATUS.contains(&status) {
-                // 429 要先认一眼应答体里的业务码。3009 = 这个号的**并发**被占满（例如它正在
-                // 官方客户端里说话），松手就没；当成额度用尽冻 5 分钟纯属误伤。
+                // 429 要先认一眼应答体里的业务码。并发占用（3009/3008，见 is_concurrency_code）
+                // = 这个号在忙，松手就没；当成额度用尽冻 5 分钟纯属误伤。
                 let code = if status == 429 {
                     let mut snip: Vec<u8> = Vec::new();
                     let _ = reader.take(600).read_to_end(&mut snip);
@@ -2996,21 +3036,27 @@ fn handle_external(
                 // 上一发 429 落在谁身上（决定这是「这个号的事」还是「出口的事」）
                 let prev_429 = { gw.inner.lock().unwrap().last_429.clone() };
                 let shared = status == 429
-                    && code != 3009
+                    && !is_concurrency_code(code)
                     && is_shared_rate_limit(
                         prev_429.as_ref().map(|(id, at)| (id.as_str(), *at)),
                         &c.id,
                         now,
                     );
-                if status == 429 && code != 3009 {
+                if status == 429 && !is_concurrency_code(code) && !saw_429 {
                     // 只记「限流形状」的 429。并发占用是号自己此刻忙，拿它当上一发会把
-                    // 「A 正忙 + B 真限流」误判成全网限流。
+                    // 「A 正忙 + B 真限流」误判成全网限流。而且**一个请求只记第一发**：
+                    // failover 链上后续的 429 是同一份洪峰的溢出，不是独立证据 ——
+                    // 以前照记，一个号过载就能滚成「跨号级联」，闸门跟着误伤。
+                    saw_429 = true;
                     gw.inner.lock().unwrap().last_429 = Some((c.id.clone(), now));
                 }
                 if shared {
                     // 判成出口级限流：闸住整条通道，这一发也别再去撞下一个号 —— 出去就是白烧，
                     // 而且**一个号都不冻**：限额不在号上，冻号只会把好号一起锁死。
                     gw.inner.lock().unwrap().rate.trip(now, RATE_GATE_MS);
+                    // 本会话若正钉着这个号就解开：闸门一开别让它原路撞回同一个过载号，
+                    // 再触发下一轮闸门。
+                    gw.unpin_sticky(&skey, &c.id);
                     crate::flowlog::log(
                         "relay",
                         "rate-gate",
@@ -3030,12 +3076,18 @@ fn handle_external(
                                             "message": format!("多个号在几十秒内都回 HTTP 429 —— 限额在出口/套餐这一层，换号或冻号都没用。已闸住整条通道 {}s，请稍后重试", RATE_GATE_MS / 1000) } }),
                     );
                 }
-                // 阶梯只记「确实是这个号的问题」那些失败。并发占用（3009）不算 —— 它只是此刻忙，
-                // 记进去会让一次全网抖动把好号一路顶到 5 分钟。
-                let counted = code != 3009;
+                // 阶梯只记「确实是这个号的问题」那些失败。并发占用（3009/3008）不算 —— 它只是
+                // 此刻忙，记进去会让一次全网抖动把好号一路顶到 5 分钟。
+                let counted = !is_concurrency_code(code);
                 let strikes = if counted { gw.bump_strike(&c.id) } else { 0 };
                 let cool = account_cooldown(status, code, strikes.max(1));
                 gw.freeze_account(&c.id, cool, freeze_label(status, code));
+                if status == 429 {
+                    // 号刚说了「限了/满了」：本会话若正钉着它就就地解开，下一发按挂载数挑新家。
+                    // 这一发 failover 成功的话 set_sticky 自会钉到落点，等价；不解开的是
+                    // failover 也没走通的那些 —— 会话会一直回头撞这个号。
+                    gw.unpin_sticky(&skey, &c.id);
+                }
                 if status == 401 {
                     // 401 = 这一发用的凭证不被认。要是这个号还存着「上次试通」的指纹，说明它
                     // 已经失效了（重新登录、token_version 被吊销都会这样）—— 清掉提示回到默认
@@ -3044,7 +3096,7 @@ fn handle_external(
                 }
                 // 顺手把该号额度取回真实值：「用完」应当由刷新确认，而不是干等 5 分钟 TTL。
                 // 但并发占用跟额度无关，重取只是白烧一次往返。
-                let refetched = if code == 3009 {
+                let refetched = if is_concurrency_code(code) {
                     false
                 } else {
                     gw.refresh_accounts(paths, vec![c.id.clone()], 0, "上游拒绝");
@@ -4153,6 +4205,18 @@ mod tests {
             Some("并发超限 —— 同一个号的模型并发被占满（例：这个号正在官方客户端里用）（code 3009）")
         );
         assert!(upstream_why(r#"{"code":3012,"msg":"unusual activity"}"#).unwrap().contains("3012"));
+        assert!(
+            upstream_why(r#"{"code":1210,"msg":"该模型始终思考"}"#)
+                .unwrap()
+                .contains("low/medium/high"),
+            "1210 要点名修法：思考强度调档，不是换号"
+        );
+        assert!(
+            upstream_why(r#"{"code":3008,"msg":"concurrency limit"}"#)
+                .unwrap()
+                .contains("3009 同族"),
+            "3008 要说清是并发占用，别让人去管额度"
+        );
         assert_eq!(upstream_why("<!doctype html><title>405</title>"), None, "HTML 没有业务码");
         assert_eq!(upstream_why("{}"), None);
     }
@@ -4166,6 +4230,8 @@ mod tests {
         assert_eq!(account_cooldown(429, 0, 99), MAX_COOLDOWN_MS, "阶梯要封顶");
         // 3009 = 并发被占满，松手就没：不参与阶梯，也不许把额度重取烧掉
         assert_eq!(account_cooldown(429, 3009, 7), CONC_COOLDOWN_MS);
+        // 3008 = 2026-11 上游开始随 429 返回的新并发码，与 3009 同族：同样短冷却不滚阶梯
+        assert_eq!(account_cooldown(429, 3008, 7), CONC_COOLDOWN_MS);
         // 与号无关的状态码不冻号（405 那类交给通道熔断）
         assert_eq!(account_cooldown(405, 0, 3), 0);
     }
@@ -4198,6 +4264,7 @@ mod tests {
     #[test]
     fn freeze_reason_names_whose_fault_it_is() {
         assert_eq!(freeze_label(429, 3009), "并发占用");
+        assert_eq!(freeze_label(429, 3008), "并发占用", "3008 同族新码，标签一致");
         assert_eq!(freeze_label(401, 0), "凭证被拒");
         assert_eq!(freeze_label(402, 0), "额度不足");
         assert_eq!(freeze_label(429, 0), "上游限流");
@@ -4350,14 +4417,17 @@ mod tests {
             left: 0.0,
         };
         let list = vec![cand("A"), cand("B"), cand("C")];
-        let used = |ids: &[&str]| -> std::collections::HashSet<String> {
-            ids.iter().map(|s| s.to_string()).collect()
-        };
 
-        assert_eq!(pick_for_new_session(&list, &used(&[])), 0, "全新池子用队首");
-        assert_eq!(pick_for_new_session(&list, &used(&["A"])), 1, "A 被占了就给 B，别继续挤 A");
-        assert_eq!(pick_for_new_session(&list, &used(&["A", "B"])), 2);
-        assert_eq!(pick_for_new_session(&list, &used(&["A", "B", "C"])), 0, "全被占用就回队首：共用好过把请求判成空池");
+        // 挂载数与候选一一对应，0 = 没有会话占着
+        assert_eq!(pick_for_new_session(&list, &[0, 0, 0]), 0, "全新池子用队首");
+        assert_eq!(pick_for_new_session(&list, &[1, 0, 0]), 1, "A 被占了就给 B，别继续挤 A");
+        assert_eq!(pick_for_new_session(&list, &[1, 1, 0]), 2);
+        // 全被占用：挑**挂载最少**的，不再回队首 —— 旧版这里永远返回 0，多出来的会话
+        // 全堆到队首同一个号上，单号并发顶爆（2026-11-03 实测 6 个子 agent 连坐）。
+        // 此时共用好过判空池，但共用的该是最闲的那个。
+        assert_eq!(pick_for_new_session(&list, &[3, 1, 2]), 1);
+        // 平票取顺序靠前的
+        assert_eq!(pick_for_new_session(&list, &[3, 2, 2]), 1);
     }
 
     #[test]
